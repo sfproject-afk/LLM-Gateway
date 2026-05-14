@@ -40,6 +40,12 @@ Environment="THINKING_BUDGET=0"
 Environment="IMAGE_BACKEND_URL=http://127.0.0.1:8091"
 Environment="IMAGE_BACKEND_TOKEN=YOUR_IMAGE_TOKEN"
 
+# xAI / Grok (опционально)
+Environment="XAI_API_BASE_URL=https://api.x.ai/v1"
+Environment="XAI_API_KEY=YOUR_XAI_API_KEY"
+Environment="XAI_MODEL=grok-4-1-fast-non-reasoning"
+Environment="XAI_PROXY_URL=http://127.0.0.1:2080"
+
 ExecStart=/usr/bin/python3 /path/to/model-gateway/model_gateway_v2.py
 Restart=always
 RestartSec=2

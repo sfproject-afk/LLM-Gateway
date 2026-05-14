@@ -22,7 +22,9 @@ import http.client
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,21 @@ else:
 
 _REWRITES_RAW = os.environ.get("MODEL_REWRITES", "")
 MODEL_REWRITES: dict[str, str] = json.loads(_REWRITES_RAW) if _REWRITES_RAW else {}
+
+_XAI_MODELS_RAW = os.environ.get("XAI_MODELS", "").strip() or os.environ.get("XAI_MODEL", "").strip()
+XAI_MODELS: frozenset[str] = (
+    frozenset(m.strip() for m in _XAI_MODELS_RAW.split(",") if m.strip())
+    if _XAI_MODELS_RAW else frozenset()
+)
+XAI_API_BASE_URL = os.environ.get("XAI_API_BASE_URL", "https://api.x.ai/v1").rstrip("/")
+XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
+XAI_PROXY_URL = (
+    os.environ.get("XAI_PROXY_URL", "").strip()
+    or os.environ.get("HTTPS_PROXY", "").strip()
+    or os.environ.get("https_proxy", "").strip()
+    or os.environ.get("HTTP_PROXY", "").strip()
+    or os.environ.get("http_proxy", "").strip()
+)
 
 _IMAGE_BACKEND_RAW = os.environ.get("IMAGE_BACKEND_URL", "").strip()
 if _IMAGE_BACKEND_RAW:
@@ -175,6 +192,66 @@ def _backend_for_model(model_name: str | None) -> tuple[str, int, str]:
             if base in BACKENDS:
                 return BACKENDS[base]
     return PRIMARY_BACKEND
+
+
+def _is_xai_model(model_name: str | None) -> bool:
+    model_name = _normalize_model_name(model_name)
+    return bool(model_name and model_name in XAI_MODELS and XAI_API_KEY)
+
+
+def _xai_model_entries() -> list[dict]:
+    return [
+        {"id": model_id, "object": "model", "owned_by": "xai"}
+        for model_id in sorted(XAI_MODELS)
+    ]
+
+
+def _sanitize_gateway_payload(body: bytes, normalized_model: str | None = None) -> bytes:
+    if not body:
+        return body
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body
+
+    changed = False
+    if normalized_model and payload.get("model") != normalized_model:
+        payload["model"] = normalized_model
+        changed = True
+    if "chat_embed_thinking" in payload:
+        del payload["chat_embed_thinking"]
+        changed = True
+
+    if not changed:
+        return body
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _build_proxy_opener(proxy_url: str | None):
+    if proxy_url:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        }))
+    return urllib.request.build_opener()
+
+
+def _join_base_url(base_url: str, request_path: str, query: str = "") -> str:
+    base_parts = urllib.parse.urlsplit(base_url)
+    base_path = base_parts.path.rstrip("/")
+    req_path = request_path or "/"
+
+    if base_path and req_path.startswith(base_path + "/"):
+        joined_path = req_path
+    elif base_path and req_path == base_path:
+        joined_path = req_path
+    elif base_path and base_path.endswith("/v1") and req_path.startswith("/v1/"):
+        joined_path = req_path
+    else:
+        joined_path = f"{base_path}{req_path}" if base_path else req_path
+
+    url = urllib.parse.urlunsplit((base_parts.scheme, base_parts.netloc, joined_path, query, ""))
+    return url
 
 
 def _extract_model(body: bytes) -> str | None:
@@ -487,7 +564,79 @@ class GatewayHandler(BaseHTTPRequestHandler):
             entry = dict(base)
             entry["id"] = virtual_id
             merged.append(entry)
+        seen_ids = {entry.get("id") for entry in merged}
+        for entry in _xai_model_entries():
+            if entry["id"] not in seen_ids:
+                merged.append(entry)
         self._send_json(200, {"object": "list", "data": merged})
+
+    def _proxy_xai_request(self, body: bytes):
+        if not XAI_API_KEY:
+            self._send_json(502, {"error": "xai_not_configured", "message": "XAI_API_KEY is missing"})
+            return
+
+        parts = urllib.parse.urlsplit(self.path)
+        upstream_url = _join_base_url(XAI_API_BASE_URL, parts.path, parts.query)
+
+        headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() not in {"host", "authorization", "expect", "content-length"}
+        }
+        headers["Authorization"] = f"Bearer {XAI_API_KEY}"
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        opener = _build_proxy_opener(XAI_PROXY_URL or None)
+        request = urllib.request.Request(
+            upstream_url,
+            data=body or None,
+            headers=headers,
+            method=self.command,
+        )
+
+        try:
+            resp = opener.open(request, timeout=3600)
+        except urllib.error.HTTPError as exc:
+            resp = exc
+        except Exception as exc:
+            self._send_json(502, {"error": "xai_backend_unreachable", "message": str(exc)})
+            return
+
+        content_type = resp.headers.get("Content-Type", "")
+        is_stream = "text/event-stream" in content_type
+
+        self.send_response(resp.status)
+        for name, value in resp.headers.items():
+            if name.lower() in HOP_BY_HOP:
+                continue
+            if name.lower() == "content-length" and is_stream:
+                continue
+            self.send_header(name, value)
+        if is_stream:
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            if is_stream:
+                while True:
+                    chunk = resp.read(STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            else:
+                self.wfile.write(resp.read())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        self.close_connection = True
 
     def _proxy_image_request(self):
         if IMAGE_BACKEND is None:
@@ -589,6 +738,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         # 4. Pick backend by model name from body
         model_name = _extract_model(body)
+
+        # 4a. Route configured xAI/Grok models to external OpenAI-compatible API.
+        if _is_xai_model(model_name):
+            if path_only.endswith("chat/completions"):
+                self.log_request_detail(model_name, 443, body)
+            body = _sanitize_gateway_payload(body, normalized_model=model_name)
+            self._proxy_xai_request(body)
+            return
+
         host, port, scheme = _backend_for_model(model_name)
 
         # Log detailed request info for analysis
@@ -596,7 +754,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.log_request_detail(model_name, port, body)
 
         # 4a. Rewrite legacy/external alias model names if needed.
-        body = _rewrite_model_in_body(body, model_name)
+        body = _sanitize_gateway_payload(_rewrite_model_in_body(body, model_name), normalized_model=model_name)
 
         # 4b. Inject thinking kwargs and handle virtual variants
         # Virtual variants (-thinking / -fast): rewrite model field + inject enable_thinking.

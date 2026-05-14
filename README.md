@@ -14,6 +14,7 @@
 - **Маршрутизация по модели** — каждая модель идёт к своему vLLM-бэкенду (по `host:port`)
 - **Переименование моделей** — внешние псевдонимы прозрачно переписываются во внутренние ID
 - **HTTPS upstream support** — URL-based upstream'ы могут работать через `https://`
+- **xAI / Grok support** — выбранные модели можно маршрутизировать во внешний OpenAI-совместимый xAI API
 - **Thinking-модели** — глобальный контроль фазы `<think>`: отключить / задать бюджет
 - **Виртуальные варианты** — для мультимодальных моделей автоматически строятся `{model}-thinking` и `{model}-fast`
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
@@ -32,6 +33,7 @@
 - поддержка `HTTPSConnection` для URL-based upstream'ов
 - корректный startup log для multi-token режима
 - внешний Bearer token больше не уходит во внутренние upstream-сервисы
+- добавлена маршрутизация xAI/Grok-моделей во внешний OpenAI-совместимый upstream через HTTP proxy
 
 ---
 
@@ -126,8 +128,14 @@ sudo systemctl enable --now model-gateway
 | `THINKING_BUDGET` | `-1` | `-1`=не управлять, `0`=отключить, `>0`=лимит токенов |
 | `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091` или `https://image.example.com`) |
 | `IMAGE_BACKEND_TOKEN` | `""` | Bearer-токен для image-сервиса |
+| `XAI_API_BASE_URL` | `https://api.x.ai/v1` | Базовый URL OpenAI-совместимого xAI API |
+| `XAI_API_KEY` | `""` | API key для xAI |
+| `XAI_MODEL` / `XAI_MODELS` | `""` | Одна или несколько моделей, которые маршрутизируются в xAI |
+| `XAI_PROXY_URL` | proxy из env, если есть | HTTP proxy для внешних запросов в xAI |
 
 > `VLLM_BACKENDS` использует формат `host:port`. Поддержка URL со схемой (`http/https`) есть для legacy fallback через `UNIVERSAL_CHAT_URL_HIGH` и для `IMAGE_BACKEND_URL`.
+
+> Для xAI/Grok используется отдельный OpenAI-совместимый upstream через `XAI_API_BASE_URL`, а внешний трафик можно направлять через локальный VLESS HTTP proxy (`XAI_PROXY_URL=http://127.0.0.1:2080`).
 
 ### Пример VLLM_BACKENDS
 
@@ -149,6 +157,17 @@ sudo systemctl enable --now model-gateway
 }
 ```
 
+### Пример xAI / Grok
+
+```bash
+XAI_API_BASE_URL=https://api.x.ai/v1
+XAI_API_KEY=your_xai_key
+XAI_MODEL=grok-4-1-fast-non-reasoning
+XAI_PROXY_URL=http://127.0.0.1:2080
+```
+
+После этого запросы с моделью `grok-4-1-fast-non-reasoning` будут отправляться не в `VLLM_BACKENDS`, а во внешний xAI API через proxy.
+
 ---
 
 ## Маршрутизация запросов
@@ -158,9 +177,11 @@ GET /v1/models
   → опрашивает ВСЕ бэкенды
   → отбирает только видимые base-модели
   → публикует виртуальные варианты {model}-thinking / {model}-fast
+  → добавляет статически настроенные xAI-модели из `XAI_MODEL` / `XAI_MODELS`
 
 POST /v1/chat/completions
   → читает поле "model" из JSON body
+  → если модель есть в `XAI_MODEL` / `XAI_MODELS` → xAI API через proxy
   → VLLM_BACKENDS[model] → нужный бэкенд
   → иначе → PRIMARY backend
 
@@ -251,6 +272,20 @@ curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
+### xAI / Grok через gateway
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-4-1-fast-non-reasoning",
+    "messages": [{"role": "user", "content": "Reply with one word: pong"}],
+    "max_tokens": 32,
+    "stream": false
+  }'
+```
+
 ---
 
 ## Деплой через systemd
@@ -316,6 +351,7 @@ curl -fsS http://127.0.0.1:8080/v1/chat/completions \
 - Маршрут `/zimage/health` работает только если настроен `IMAGE_BACKEND_URL`.
 - Если `MODEL_GATEWAY_TOKENS` задан, он имеет приоритет над `MODEL_GATEWAY_TOKEN`.
 - Внутренние vLLM/image backend'ы не получают внешний клиентский `Authorization` header, если он не переопределён явно самим gateway.
+- Для xAI/Grok gateway использует отдельный upstream Bearer token из `XAI_API_KEY`, а не клиентский токен gateway.
 - `/v1/models` публикует не «все сырые backend ID», а отфильтрованный список видимых виртуальных моделей для UI.
 
 ---
