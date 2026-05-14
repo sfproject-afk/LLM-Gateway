@@ -1,8 +1,8 @@
-# model-gateway-v2
+# LLM-Gateway
 
-Лёгкий **reverse proxy** для нескольких vLLM-бэкендов с токен-аутентификацией, маршрутизацией по модели и управлением thinking-режимом.
+Лёгкий **reverse proxy** для нескольких vLLM-бэкендов с токен-аутентификацией, маршрутизацией по модели, управлением thinking-режимом и проксированием image backend.
 
-Написан на чистом Python (только стандартная библиотека — никаких зависимостей для ядра прокси).
+Ядро написано на чистом Python: только стандартная библиотека, без обязательных `pip`-зависимостей.
 
 ---
 
@@ -11,12 +11,56 @@
 - **Multi-token Bearer auth** — несколько токенов с лейблами клиентов
 - **Маршрутизация по модели** — каждая модель идёт к своему vLLM-бэкенду (по `host:port`)
 - **Переименование моделей** — внешние псевдонимы прозрачно переписываются во внутренние ID
-- **Thinking-модели** — глобальный контроль fase `<think>`: отключить / задать бюджет
+- **Thinking-модели** — глобальный контроль фазы `<think>`: отключить / задать бюджет
 - **Виртуальные варианты** — для мультимодальных моделей автоматически строятся `{model}-thinking` и `{model}-fast`
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
 - **Встраивание reasoning** — `reasoning_content` → `<think>…</think>` в `delta.content` (опционально)
 - **Image backend** — проксирование запросов генерации изображений на отдельный сервис
-- **Агрегация `/v1/models`** — опрашивает все бэкенды и отдаёт единый список
+- **Курируемый `/v1/models`** — опрашивает все бэкенды и отдаёт единый список видимых виртуальных моделей для UI
+
+---
+
+## Архитектура
+
+```text
+Client / Open WebUI / Agent
+       |
+       v
+  LLM-Gateway (:8080)
+    |        |        \
+    |        |         \
+    |        |          -> Image backend (:8091)
+    |        |
+    |        -> vLLM backend B (:8001)
+    |
+    -> vLLM backend A (:8000)
+```
+
+Основная логика:
+
+1. Gateway принимает OpenAI-совместимый HTTP-запрос.
+2. Проверяет Bearer-токен.
+3. Извлекает `model` из JSON body.
+4. Выбирает нужный backend по `VLLM_BACKENDS`.
+5. При необходимости:
+  - переписывает ID модели через `MODEL_REWRITES`
+  - инжектирует `chat_template_kwargs` для thinking-моделей
+  - проксирует image-запросы на отдельный image backend
+6. Возвращает ответ клиенту, сохраняя SSE-стриминг.
+
+---
+
+## Структура репозитория
+
+```text
+.
+├── model_gateway_v2.py     # основной HTTP proxy
+├── model-gateway.service   # пример systemd unit
+├── .env.example            # шаблон конфигурации
+├── scripts/
+│   └── smoke_test.sh       # быстрый smoke test для /v1/models и /v1/chat/completions
+└── README.md
+```
 
 ---
 
@@ -24,15 +68,16 @@
 
 ```bash
 # 1. Клонировать
-git clone https://github.com/sfproject-afk/model-gateway-v2.git
-cd model-gateway-v2
+git clone https://github.com/sfproject-afk/LLM-Gateway.git
+cd LLM-Gateway
 
 # 2. Скопировать и заполнить конфиг
 cp .env.example .env
 
-# 3. Запустить напрямую
-MODEL_GATEWAY_TOKEN=mytoken \
-VLLM_BACKENDS='{"my-model":"127.0.0.1:8000"}' \
+# 3. Запустить напрямую из .env
+set -a
+source .env
+set +a
 python3 model_gateway_v2.py
 ```
 
@@ -40,7 +85,7 @@ python3 model_gateway_v2.py
 
 ```bash
 sudo cp model-gateway.service /etc/systemd/system/
-# отредактировать пути и env-переменные в service-файле
+# отредактировать пути в service-файле и создать .env рядом с проектом
 sudo systemctl daemon-reload
 sudo systemctl enable --now model-gateway
 ```
@@ -49,7 +94,9 @@ sudo systemctl enable --now model-gateway
 
 ## Конфигурация
 
-Все параметры задаются переменными окружения (в systemd — через `Environment=`).
+Все параметры задаются переменными окружения.
+
+Рекомендуемый вариант для production: хранить их в `.env`, а systemd подключать через `EnvironmentFile=`.
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
@@ -58,7 +105,7 @@ sudo systemctl enable --now model-gateway
 | `MODEL_GATEWAY_TOKEN` | `""` | Одиночный Bearer-токен |
 | `MODEL_GATEWAY_TOKENS` | `""` | Мультитокен: `tok1\|label1,tok2\|label2` |
 | `VLLM_BACKENDS` | `""` | JSON: `{"model-id":"host:port", ...}` |
-| `VLLM_PRIMARY` | первый из BACKENDS | Fallback-бэкенд |
+| `VLLM_PRIMARY` | первый из `VLLM_BACKENDS` | Fallback-бэкенд |
 | `MODEL_REWRITES` | `""` | JSON: `{"alias":"internal-id"}` |
 | `THINKING_MODELS` | `""` | Comma-separated имена thinking-моделей |
 | `THINKING_BUDGET` | `-1` | `-1`=не управлять, `0`=отключить, `>0`=лимит токенов |
@@ -91,7 +138,9 @@ sudo systemctl enable --now model-gateway
 
 ```
 GET /v1/models
-  → опрашивает ВСЕ бэкенды → виртуальные варианты {model}-thinking / {model}-fast
+  → опрашивает ВСЕ бэкенды
+  → отбирает только видимые base-модели
+  → публикует виртуальные варианты {model}-thinking / {model}-fast
 
 POST /v1/chat/completions
   → читает поле "model" из JSON body
@@ -108,7 +157,7 @@ GET  /zimage/*
 
 ### Виртуальные варианты
 
-Gateway автоматически опрашивает бэкенды при старте. Для моделей из `PREFERRED_VISIBLE_BASE_MODELS` (по умолчанию `qwen3.6-35b`, `gemma4-26b`) строятся два виртуальных ID:
+Gateway автоматически опрашивает бэкенды при старте. Для моделей из `PREFERRED_VISIBLE_BASE_MODELS` (по умолчанию `qwen3.6-35b`, `gemma4-26b`) строятся два виртуальных ID, если такие модели реально присутствуют на backend'ах:
 
 - `{model}-thinking` → включает `enable_thinking=true`
 - `{model}-fast` → включает `enable_thinking=false`
@@ -182,6 +231,72 @@ curl http://localhost:8080/v1/chat/completions \
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
+
+---
+
+## Деплой через systemd
+
+1. Клонируйте репозиторий в постоянную директорию, например `/opt/llm-gateway`.
+2. Скопируйте `.env.example` в `.env` и заполните значения.
+3. Откройте `model-gateway.service` и замените:
+   - `YOUR_USER`
+   - `/path/to/model-gateway`
+4. Установите unit:
+
+```bash
+sudo cp model-gateway.service /etc/systemd/system/model-gateway.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now model-gateway
+sudo systemctl status model-gateway --no-pager
+```
+
+Если менялся `.env` или unit:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart model-gateway
+```
+
+---
+
+## Smoke tests
+
+### Готовый скрипт
+
+```bash
+chmod +x scripts/smoke_test.sh
+TOKEN=YOUR_TOKEN MODEL=my-model ./scripts/smoke_test.sh
+```
+
+### Ручная проверка `/v1/models`
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+### Ручная проверка `/v1/chat/completions`
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "messages": [{"role": "user", "content": "Ответь одним словом: pong"}],
+    "max_tokens": 32,
+    "stream": false
+  }'
+```
+
+---
+
+## Операционные замечания
+
+- У gateway **нет отдельного `/health` endpoint** для chat proxy; для проверки доступности используйте `/v1/models` или тестовый `chat/completions`.
+- Маршрут `/zimage/health` работает только если настроен `IMAGE_BACKEND_URL`.
+- Если `MODEL_GATEWAY_TOKENS` задан, он имеет приоритет над `MODEL_GATEWAY_TOKEN`.
+- `/v1/models` публикует не «все сырые backend ID», а отфильтрованный список видимых виртуальных моделей для UI.
 
 ---
 

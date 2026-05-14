@@ -8,7 +8,10 @@ Type=simple
 User=YOUR_USER
 WorkingDirectory=/path/to/model-gateway
 
-# Конфигурируйте через .env файл или напрямую:
+# Рекомендуемый способ: хранить секреты и backend map в .env рядом с проектом.
+EnvironmentFile=-/path/to/model-gateway/.env
+
+# Значения ниже — безопасные дефолты / примеры. Их можно переопределить в .env.
 Environment="MODEL_GATEWAY_HOST=0.0.0.0"
 Environment="MODEL_GATEWAY_PORT=8080"
 
