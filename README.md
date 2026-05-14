@@ -4,6 +4,8 @@
 
 Ядро написано на чистом Python: только стандартная библиотека, без обязательных `pip`-зависимостей.
 
+**English:** Lightweight reverse proxy for multiple vLLM backends with Bearer-token authentication, model-based routing, thinking-mode control, SSE streaming support, and optional image-backend proxying.
+
 ---
 
 ## Возможности
