@@ -58,25 +58,31 @@ else:
 # Parse VLLM_BACKENDS env: JSON map  model_name → "host:port"
 _BACKENDS_RAW = os.environ.get("VLLM_BACKENDS", "")
 if _BACKENDS_RAW:
-    _bmap: dict[str, tuple[str, int]] = {}
+    _bmap: dict[str, tuple[str, int, str]] = {}
     for _name, _hostport in json.loads(_BACKENDS_RAW).items():
         _h, _p = _hostport.rsplit(":", 1)
-        _bmap[_name] = (_h, int(_p))
+        _bmap[_name] = (_h, int(_p), "http")
 else:
     # Fallback: legacy single-backend env
     _url   = os.environ.get("UNIVERSAL_CHAT_URL_HIGH", "http://127.0.0.1:8000")
     _ps    = urllib.parse.urlparse(_url)
-    _bmap  = {"universal-nemotron": (_ps.hostname or "127.0.0.1", _ps.port or 8000)}
+    _bmap  = {
+        "universal-nemotron": (
+            _ps.hostname or "127.0.0.1",
+            _ps.port or 8000,
+            _ps.scheme or "http",
+        )
+    }
 
-BACKENDS: dict[str, tuple[str, int]] = _bmap
+BACKENDS: dict[str, tuple[str, int, str]] = _bmap
 # Unique backend addresses in insertion order (for /v1/models fan-out)
-ALL_BACKENDS: list[tuple[str, int]] = list(dict.fromkeys(BACKENDS.values()))
+ALL_BACKENDS: list[tuple[str, int, str]] = list(dict.fromkeys(BACKENDS.values()))
 
 # Primary backend: explicit override or first entry
 _PRIMARY_RAW = os.environ.get("VLLM_PRIMARY", "")
 if _PRIMARY_RAW:
     _ph, _pp      = _PRIMARY_RAW.rsplit(":", 1)
-    PRIMARY_BACKEND: tuple[str, int] = (_ph, int(_pp))
+    PRIMARY_BACKEND: tuple[str, int, str] = (_ph, int(_pp), "http")
 else:
     PRIMARY_BACKEND = next(iter(BACKENDS.values()))
 
@@ -86,7 +92,8 @@ MODEL_REWRITES: dict[str, str] = json.loads(_REWRITES_RAW) if _REWRITES_RAW else
 _IMAGE_BACKEND_RAW = os.environ.get("IMAGE_BACKEND_URL", "").strip()
 if _IMAGE_BACKEND_RAW:
     _image_parts = urllib.parse.urlparse(_IMAGE_BACKEND_RAW)
-    IMAGE_BACKEND: tuple[str, int, str] | None = (
+    IMAGE_BACKEND: tuple[str, int, str, str] | None = (
+        _image_parts.scheme or "http",
         _image_parts.hostname or "127.0.0.1",
         _image_parts.port or (443 if _image_parts.scheme == "https" else 80),
         _image_parts.path.rstrip("/"),
@@ -145,7 +152,19 @@ def _normalize_model_name(model_name: str | None) -> str | None:
         return model_name[:-7]
     return model_name
 
-def _backend_for_model(model_name: str | None) -> tuple[str, int]:
+def _make_connection(host: str, port: int, timeout: float, scheme: str = "http"):
+    if scheme == "https":
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def _path_only(path: str) -> str:
+    parsed = urllib.parse.urlsplit(path)
+    normalized = parsed.path.rstrip("/")
+    return normalized or "/"
+
+
+def _backend_for_model(model_name: str | None) -> tuple[str, int, str]:
     """Return (host, port) for the given model name, falling back to PRIMARY."""
     model_name = _normalize_model_name(model_name)
     if model_name:
@@ -192,10 +211,10 @@ def _effective_model_name(body: bytes, fallback_model: str | None) -> str | None
         return fallback_model
 
 
-def _fetch_models(host: str, port: int, timeout: float = 5.0) -> list:
+def _fetch_models(host: str, port: int, scheme: str = "http", timeout: float = 5.0) -> list:
     """Fetch /v1/models from a backend, return the data list (empty on error)."""
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn = _make_connection(host, port, timeout=timeout, scheme=scheme)
         conn.request("GET", "/v1/models", headers={"Accept": "application/json"})
         resp = conn.getresponse()
         if resp.status != 200:
@@ -213,12 +232,12 @@ def _refresh_live_model_maps() -> None:
     """Augment backend routing from live backend model IDs and rebuild visible variants."""
     global VISIBLE_BASE_MODELS, VISIBLE_VARIANT_IDS, MODEL_VARIANTS
 
-    discovered: dict[str, tuple[str, int]] = {}
-    for host, port in ALL_BACKENDS:
-        for entry in _fetch_models(host, port):
+    discovered: dict[str, tuple[str, int, str]] = {}
+    for host, port, scheme in ALL_BACKENDS:
+        for entry in _fetch_models(host, port, scheme=scheme):
             model_id = _normalize_model_name(entry.get("id"))
             if model_id:
-                discovered.setdefault(model_id, (host, port))
+                discovered.setdefault(model_id, (host, port, scheme))
 
     for model_id, backend in discovered.items():
         BACKENDS.setdefault(model_id, backend)
@@ -414,6 +433,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         fwd["Host"] = f"{host}:{port}"
         if "Expect" in fwd:
             del fwd["Expect"]
+        if "Authorization" in fwd:
+            del fwd["Authorization"]
         if body:
             fwd["Content-Length"] = str(len(body))
         elif "Content-Length" in fwd:
@@ -453,13 +474,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         """Expose only the four visible fast/thinking variants for Gemma and Qwen 3.6."""
         merged: list = []
         base_entries: dict[str, dict] = {}
-        for host, port in ALL_BACKENDS:
-            for entry in _fetch_models(host, port):
+        for host, port, scheme in ALL_BACKENDS:
+            for entry in _fetch_models(host, port, scheme=scheme):
                 mid = _normalize_model_name(entry.get("id", ""))
                 if mid in VISIBLE_BASE_MODELS and mid not in base_entries:
                     base_entries[mid] = entry
         # Add only virtual thinking/fast variants.
-        for virtual_id, (base_id, enable_thinking) in MODEL_VARIANTS.items():
+        for virtual_id, (base_id, _) in MODEL_VARIANTS.items():
             if virtual_id not in VISIBLE_VARIANT_IDS:
                 continue
             base = base_entries.get(base_id, {"id": base_id, "object": "model", "owned_by": "llamacpp"})
@@ -473,11 +494,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not_found", "message": "Image backend is not configured"})
             return
 
-        host, port, base_path = IMAGE_BACKEND
-        raw_path = self.path.rstrip("/")
-        if raw_path == "/zimage/health":
+        scheme, host, port, base_path = IMAGE_BACKEND
+        path_only = _path_only(self.path)
+        if path_only == "/zimage/health":
             upstream_path = f"{base_path}/health"
-        elif raw_path == "/zimage/generate":
+        elif path_only == "/zimage/generate":
             if not self._authorized():
                 self._send_json(401, {
                     "error": "unauthorized",
@@ -485,7 +506,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 })
                 return
             upstream_path = f"{base_path}/v1/generate"
-        elif raw_path == "/v1/images/generations":
+        elif path_only == "/v1/images/generations":
             if not self._authorized():
                 self._send_json(401, {
                     "error": "unauthorized",
@@ -493,14 +514,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 })
                 return
             upstream_path = f"{base_path}/v1/images/generations"
-        elif self.path.startswith("/zimage/images/"):
+        elif urllib.parse.urlsplit(self.path).path.startswith("/zimage/images/"):
             upstream_path = f"{base_path}{self.path[len('/zimage'):] }"
         else:
             self._send_json(404, {"error": "not_found", "message": "Unknown zimage route"})
             return
 
         body = self._read_request_body()
-        if raw_path == "/v1/images/generations":
+        if path_only == "/v1/images/generations":
             preview = body[:200].decode("utf-8", errors="replace").replace("\n", " ")
             self.log_message(
                 'IMAGE  te=%r cl=%r ct=%r expect=%r bytes=%d preview=%r',
@@ -513,10 +534,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
 
         headers = self._fwd_headers(host, port, body)
-        if IMAGE_BACKEND_TOKEN and raw_path in {"/zimage/generate", "/v1/images/generations"}:
+        if IMAGE_BACKEND_TOKEN and path_only in {"/zimage/generate", "/v1/images/generations"}:
             headers["Authorization"] = f"Bearer {IMAGE_BACKEND_TOKEN}"
 
-        conn = http.client.HTTPConnection(host, port, timeout=3600)
+        conn = _make_connection(host, port, timeout=3600, scheme=scheme)
         try:
             conn.request(self.command, upstream_path, body=body or None, headers=headers)
             resp = conn.getresponse()
@@ -544,7 +565,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # ---- Core proxy logic -----------------------------------------------
 
     def _proxy(self):
-        if self.path.startswith("/zimage/") or self.path.rstrip("/") == "/v1/images/generations":
+        path_only = _path_only(self.path)
+
+        if urllib.parse.urlsplit(self.path).path.startswith("/zimage/") or path_only == "/v1/images/generations":
             self._proxy_image_request()
             return
 
@@ -557,7 +580,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         # 2. Special case: GET /v1/models — merge from all backends
-        if self.command == "GET" and self.path.rstrip("/") == "/v1/models":
+        if self.command == "GET" and path_only == "/v1/models":
             self._handle_models()
             return
 
@@ -566,10 +589,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         # 4. Pick backend by model name from body
         model_name = _extract_model(body)
-        host, port = _backend_for_model(model_name)
+        host, port, scheme = _backend_for_model(model_name)
 
         # Log detailed request info for analysis
-        if self.path.rstrip("/").endswith("chat/completions"):
+        if path_only.endswith("chat/completions"):
             self.log_request_detail(model_name, port, body)
 
         # 4a. Rewrite legacy/external alias model names if needed.
@@ -584,7 +607,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         needs_think_embed = False  # whether to rewrite reasoning_content into content
         if (
             body
-            and self.path.rstrip("/").endswith("chat/completions")
+            and path_only.endswith("chat/completions")
         ):
             try:
                 payload = json.loads(body)
@@ -624,7 +647,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 pass  # body not valid JSON — leave as-is
 
         # 5. Send request to vLLM backend
-        conn = http.client.HTTPConnection(host, port, timeout=3600)
+        conn = _make_connection(host, port, timeout=3600, scheme=scheme)
         fwd = self._fwd_headers(host, port, body)
         try:
             conn.request(self.command, self.path, body=body or None, headers=fwd)
@@ -691,13 +714,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    summary = ", ".join(f"{n}→{h}:{p}" for n, (h, p) in BACKENDS.items())
+    summary = ", ".join(f"{n}→{scheme}://{h}:{p}" for n, (h, p, scheme) in BACKENDS.items())
     server  = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), GatewayHandler)
     print(
         f"[gateway] {LISTEN_HOST}:{LISTEN_PORT}  "
         f"backends=[{summary}]  "
-        f"primary={PRIMARY_BACKEND[0]}:{PRIMARY_BACKEND[1]}  "
-        f"auth={'token' if TOKEN else 'DISABLED'}",
+        f"primary={PRIMARY_BACKEND[2]}://{PRIMARY_BACKEND[0]}:{PRIMARY_BACKEND[1]}  "
+        f"auth={'token' if ALLOWED_TOKENS else 'DISABLED'}",
         flush=True,
     )
     try:
