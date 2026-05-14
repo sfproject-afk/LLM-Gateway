@@ -1,0 +1,45 @@
+[Unit]
+Description=External AI Model Gateway
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/model-gateway
+
+# Конфигурируйте через .env файл или напрямую:
+Environment="MODEL_GATEWAY_HOST=0.0.0.0"
+Environment="MODEL_GATEWAY_PORT=8080"
+
+# Одиночный токен (упрощённый вариант)
+Environment="MODEL_GATEWAY_TOKEN=YOUR_BEARER_TOKEN"
+
+# Мультитоken: token1|label1,token2|label2
+Environment="MODEL_GATEWAY_TOKENS=YOUR_TOKEN_1|admin,YOUR_TOKEN_2|client"
+
+# Маппинг: model_name → host:port (JSON)
+Environment="VLLM_BACKENDS={\"model-name-1\":\"127.0.0.1:8000\",\"model-name-2\":\"127.0.0.1:8001\"}"
+
+# Primary (fallback) backend
+Environment="VLLM_PRIMARY=127.0.0.1:8000"
+
+# Переименование моделей: входящее имя → имя для бэкенда
+Environment="MODEL_REWRITES={\"public-alias\":\"internal-model-id\"}"
+
+# Thinking-модели (comma-separated имена)
+Environment="THINKING_MODELS=model-name-1"
+
+# Thinking budget: -1=не управлять, 0=отключить thinking, >0=лимит токенов
+Environment="THINKING_BUDGET=0"
+
+# Image backend (опционально)
+Environment="IMAGE_BACKEND_URL=http://127.0.0.1:8091"
+Environment="IMAGE_BACKEND_TOKEN=YOUR_IMAGE_TOKEN"
+
+ExecStart=/usr/bin/python3 /path/to/model-gateway/model_gateway_v2.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
