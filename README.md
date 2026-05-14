@@ -13,12 +13,25 @@
 - **Multi-token Bearer auth** — несколько токенов с лейблами клиентов
 - **Маршрутизация по модели** — каждая модель идёт к своему vLLM-бэкенду (по `host:port`)
 - **Переименование моделей** — внешние псевдонимы прозрачно переписываются во внутренние ID
+- **HTTPS upstream support** — URL-based upstream'ы могут работать через `https://`
 - **Thinking-модели** — глобальный контроль фазы `<think>`: отключить / задать бюджет
 - **Виртуальные варианты** — для мультимодальных моделей автоматически строятся `{model}-thinking` и `{model}-fast`
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
 - **Встраивание reasoning** — `reasoning_content` → `<think>…</think>` в `delta.content` (опционально)
 - **Image backend** — проксирование запросов генерации изображений на отдельный сервис
+- **Безопасный header forwarding** — внешний `Authorization` не проксируется во внутренние backend'ы
 - **Курируемый `/v1/models`** — опрашивает все бэкенды и отдаёт единый список видимых виртуальных моделей для UI
+
+---
+
+## Что обновлено
+
+Актуальное состояние README соответствует текущему `model_gateway_v2.py`, включая последние исправления:
+
+- корректная обработка special-case маршрутов независимо от query string (`/v1/models?x=1`, `/zimage/health?check=1` и т.д.)
+- поддержка `HTTPSConnection` для URL-based upstream'ов
+- корректный startup log для multi-token режима
+- внешний Bearer token больше не уходит во внутренние upstream-сервисы
 
 ---
 
@@ -111,8 +124,10 @@ sudo systemctl enable --now model-gateway
 | `MODEL_REWRITES` | `""` | JSON: `{"alias":"internal-id"}` |
 | `THINKING_MODELS` | `""` | Comma-separated имена thinking-моделей |
 | `THINKING_BUDGET` | `-1` | `-1`=не управлять, `0`=отключить, `>0`=лимит токенов |
-| `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091`) |
+| `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091` или `https://image.example.com`) |
 | `IMAGE_BACKEND_TOKEN` | `""` | Bearer-токен для image-сервиса |
+
+> `VLLM_BACKENDS` использует формат `host:port`. Поддержка URL со схемой (`http/https`) есть для legacy fallback через `UNIVERSAL_CHAT_URL_HIGH` и для `IMAGE_BACKEND_URL`.
 
 ### Пример VLLM_BACKENDS
 
@@ -156,6 +171,8 @@ GET  /zimage/*
 все остальные пути
   → то же, что chat/completions (по model field, fallback → PRIMARY)
 ```
+
+Во всех special-case маршрутах gateway использует path **без query string**, поэтому `/v1/models?foo=bar` обрабатывается так же, как и обычный `/v1/models`.
 
 ### Виртуальные варианты
 
@@ -298,6 +315,7 @@ curl -fsS http://127.0.0.1:8080/v1/chat/completions \
 - У gateway **нет отдельного `/health` endpoint** для chat proxy; для проверки доступности используйте `/v1/models` или тестовый `chat/completions`.
 - Маршрут `/zimage/health` работает только если настроен `IMAGE_BACKEND_URL`.
 - Если `MODEL_GATEWAY_TOKENS` задан, он имеет приоритет над `MODEL_GATEWAY_TOKEN`.
+- Внутренние vLLM/image backend'ы не получают внешний клиентский `Authorization` header, если он не переопределён явно самим gateway.
 - `/v1/models` публикует не «все сырые backend ID», а отфильтрованный список видимых виртуальных моделей для UI.
 
 ---
