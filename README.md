@@ -20,6 +20,7 @@
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
 - **Встраивание reasoning** — `reasoning_content` → `<think>…</think>` в `delta.content` (опционально)
 - **Image backend** — проксирование запросов генерации изображений на отдельный сервис
+- **Manager UI** — встроенная web-панель со статистикой запросов, списком публикуемых моделей и статусом backend'ов
 - **Безопасный header forwarding** — внешний `Authorization` не проксируется во внутренние backend'ы
 - **Курируемый `/v1/models`** — опрашивает все бэкенды и отдаёт единый список видимых виртуальных моделей для UI
 
@@ -106,6 +107,13 @@ sudo cp model-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now model-gateway
 ```
+
+После запуска доступны:
+
+- `GET /manager/html` — встроенная HTML-панель
+- `GET /manager/api/dashboard` — JSON со статистикой, backend status и опубликованными моделями
+
+Если включена Bearer-аутентификация, `manager/api/dashboard` использует тот же токен, что и основной gateway API.
 
 ---
 
@@ -353,6 +361,7 @@ curl -fsS http://127.0.0.1:8080/v1/chat/completions \
 - Внутренние vLLM/image backend'ы не получают внешний клиентский `Authorization` header, если он не переопределён явно самим gateway.
 - Для xAI/Grok gateway использует отдельный upstream Bearer token из `XAI_API_KEY`, а не клиентский токен gateway.
 - `/v1/models` публикует не «все сырые backend ID», а отфильтрованный список видимых виртуальных моделей для UI.
+- Manager UI хранит последние запросы и ошибки только в памяти процесса; после рестарта история очищается.
 
 ---
 
