@@ -1111,16 +1111,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             pass
 
     def _fwd_headers(self, host: str, port: int, body: bytes) -> dict[str, str]:
-        fwd = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
-        fwd["Host"] = f"{host}:{port}"
-        if "Expect" in fwd:
-            del fwd["Expect"]
-        if "Authorization" in fwd:
-            del fwd["Authorization"]
+        fwd = {
+            "Host": f"{host}:{port}",
+            "Accept": "application/json",
+            "User-Agent": "model-gateway-v2",
+        }
+        content_type = self.headers.get("Content-Type")
+        if content_type:
+            fwd["Content-Type"] = content_type
+        elif body:
+            fwd["Content-Type"] = "application/json"
         if body:
             fwd["Content-Length"] = str(len(body))
-        elif "Content-Length" in fwd:
-            del fwd["Content-Length"]
         return fwd
 
     def _read_request_body(self) -> bytes:
