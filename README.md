@@ -17,6 +17,7 @@
 - **xAI / Grok support** — выбранные модели можно маршрутизировать во внешний OpenAI-совместимый xAI API
 - **Thinking-модели** — глобальный контроль фазы `<think>`: отключить / задать бюджет
 - **Виртуальные варианты** — для мультимодальных моделей автоматически строятся `{model}-thinking` и `{model}-fast`
+- **Очередь по backend'у** — не больше одного активного LLM-запроса на физический backend, остальные ждут FIFO
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
 - **Встраивание reasoning** — `reasoning_content` → `<think>…</think>` в `delta.content` (опционально)
 - **Image backend** — проксирование запросов генерации изображений на отдельный сервис
@@ -63,6 +64,7 @@ Client / Open WebUI / Agent
 5. При необходимости:
   - переписывает ID модели через `MODEL_REWRITES`
   - инжектирует `chat_template_kwargs` для thinking-моделей
+  - ставит локальные LLM-запросы в FIFO-очередь физического backend'а
   - проксирует image-запросы на отдельный image backend
 6. Возвращает ответ клиенту, сохраняя SSE-стриминг.
 
@@ -134,6 +136,8 @@ sudo systemctl enable --now model-gateway
 | `MODEL_REWRITES` | `""` | JSON: `{"alias":"internal-id"}` |
 | `THINKING_MODELS` | `""` | Comma-separated имена thinking-моделей |
 | `THINKING_BUDGET` | `-1` | `-1`=не управлять, `0`=отключить, `>0`=лимит токенов |
+| `MODEL_QUEUE_MAX_SIZE` | `5` | Максимум ожидающих LLM-запросов на физический backend |
+| `MODEL_QUEUE_TIMEOUT` | `60` | Максимум ожидания свободного слота backend'а, секунд |
 | `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091` или `https://image.example.com`) |
 | `IMAGE_BACKEND_TOKEN` | `""` | Bearer-токен для image-сервиса |
 | `XAI_API_BASE_URL` | `https://api.x.ai/v1` | Базовый URL OpenAI-совместимого xAI API |
@@ -192,6 +196,7 @@ POST /v1/chat/completions
   → если модель есть в `XAI_MODEL` / `XAI_MODELS` → xAI API через proxy
   → VLLM_BACKENDS[model] → нужный бэкенд
   → иначе → PRIMARY backend
+  → локальные VLLM/llama.cpp запросы проходят через очередь физического backend'а
 
 POST /v1/images/generations
 GET  /zimage/*
@@ -209,6 +214,16 @@ Gateway автоматически опрашивает бэкенды при с
 
 - `{model}-thinking` → включает `enable_thinking=true`
 - `{model}-fast` → включает `enable_thinking=false`
+
+### Очередь LLM-запросов
+
+Gateway ограничивает локальные LLM backend'ы одним активным запросом на физический `scheme://host:port`. Все aliases и виртуальные варианты одной модели делят одну очередь. Успешный запрос остаётся OpenAI-compatible и просто ждёт своей очереди; итоговый ответ содержит headers:
+
+- `X-Gateway-Queue-Key`
+- `X-Gateway-Queue-Initial-Position`
+- `X-Gateway-Queue-Wait-Ms`
+
+Если очередь заполнена, gateway возвращает `503 {"error":"queue_full", ...}` и header `Retry-After`. Если запрос ждал дольше `MODEL_QUEUE_TIMEOUT`, возвращается `503 {"error":"queue_timeout", ...}`.
 
 ---
 
@@ -362,6 +377,7 @@ curl -fsS http://127.0.0.1:8080/v1/chat/completions \
 - Для xAI/Grok gateway использует отдельный upstream Bearer token из `XAI_API_KEY`, а не клиентский токен gateway.
 - `/v1/models` публикует не «все сырые backend ID», а отфильтрованный список видимых виртуальных моделей для UI.
 - Manager UI хранит последние запросы и ошибки только в памяти процесса; после рестарта история очищается.
+- Очередь также хранится только в памяти процесса; после рестарта ожидающие HTTP-запросы обрываются.
 
 ---
 

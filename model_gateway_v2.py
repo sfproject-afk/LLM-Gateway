@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -123,6 +124,11 @@ IMAGE_BACKEND_TOKEN = os.environ.get("IMAGE_BACKEND_TOKEN", "")
 # SSE streaming chunk size (8 KB)
 STREAM_CHUNK = 8 * 1024
 
+# Per-backend queueing.  The gateway accepts many client connections, but each
+# physical local LLM backend should only receive one active request at a time.
+MODEL_QUEUE_MAX_SIZE = int(os.environ.get("MODEL_QUEUE_MAX_SIZE", "5"))
+MODEL_QUEUE_TIMEOUT = float(os.environ.get("MODEL_QUEUE_TIMEOUT", "60"))
+
 # Thinking-model config: control reasoning/thinking behaviour per model.
 # THINKING_MODELS — comma-separated model names that support thinking mode.
 # THINKING_BUDGET  — controls thinking injection:
@@ -163,6 +169,9 @@ GATEWAY_STATS = {
         "recent_errors": [],
         "last_request_ts": None,
 }
+
+QUEUE_LOCK = threading.Condition()
+QUEUE_STATES: dict[str, dict] = {}
 
 MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -364,6 +373,16 @@ MANAGER_HTML = """<!DOCTYPE html>
         <div class="section single">
             <div class="card">
                 <div class="panel-title">
+                    <h2>Очереди</h2>
+                    <span class="pill">1 active per backend</span>
+                </div>
+                <div id="queueTable"></div>
+            </div>
+        </div>
+
+        <div class="section single">
+            <div class="card">
+                <div class="panel-title">
                     <h2>Последние ошибки</h2>
                     <span class="pill">max 20</span>
                 </div>
@@ -380,6 +399,7 @@ MANAGER_HTML = """<!DOCTYPE html>
         const backendTable = document.getElementById('backendTable');
         const modelTable = document.getElementById('modelTable');
         const recentTable = document.getElementById('recentTable');
+        const queueTable = document.getElementById('queueTable');
         const errorsBox = document.getElementById('errorsBox');
         const lastRefresh = document.getElementById('lastRefresh');
         const publishedCount = document.getElementById('publishedCount');
@@ -414,6 +434,7 @@ MANAGER_HTML = """<!DOCTYPE html>
                 backendTable.innerHTML = '';
                 modelTable.innerHTML = '';
                 recentTable.innerHTML = '';
+                queueTable.innerHTML = '';
                 errorsBox.innerHTML = `<div class="error-box">${escapeHtml(err.message)}</div>`;
             }
         }
@@ -462,14 +483,30 @@ MANAGER_HTML = """<!DOCTYPE html>
                 `).join('')}</tbody>
             </table>`;
 
+            queueTable.innerHTML = `<table>
+                <thead><tr><th>Backend</th><th>Active</th><th>Waiting</th><th>Limit</th><th>Last wait</th><th>Avg wait</th><th>Totals</th></tr></thead>
+                <tbody>${(data.queues || []).map(row => `
+                    <tr>
+                        <td class="mono">${escapeHtml(row.queue_key)}</td>
+                        <td>${row.active ? `<span class="tag">${escapeHtml(row.active_model || 'active')}</span> ${escapeHtml(row.active_seconds || 0)}s` : '—'}</td>
+                        <td>${escapeHtml(row.waiting)}</td>
+                        <td>${escapeHtml(row.max_queue_size)} / ${escapeHtml(row.timeout_seconds)}s</td>
+                        <td>${escapeHtml(row.last_wait_ms || 0)} ms</td>
+                        <td>${escapeHtml(row.avg_wait_ms || 0)} ms</td>
+                        <td class="muted">queued ${escapeHtml(row.queued_total)}, full ${escapeHtml(row.full_total)}, timeout ${escapeHtml(row.timeout_total)}</td>
+                    </tr>
+                `).join('') || '<tr><td colspan="7" class="muted">Очередей пока нет.</td></tr>'}</tbody>
+            </table>`;
+
             recentTable.innerHTML = `<table>
-                <thead><tr><th>Время</th><th>Path</th><th>Model</th><th>Status</th><th>Client</th><th>Duration</th><th>Upstream</th></tr></thead>
+                <thead><tr><th>Время</th><th>Path</th><th>Model</th><th>Status</th><th>Queue</th><th>Client</th><th>Duration</th><th>Upstream</th></tr></thead>
                 <tbody>${(data.stats.recent_requests || []).map(row => `
                     <tr>
                         <td>${fmtTime(row.ts)}</td>
                         <td class="mono">${escapeHtml(row.path)}</td>
                         <td class="mono">${escapeHtml(row.model || '—')}</td>
                         <td>${escapeHtml(row.status)}</td>
+                        <td>${row.queue_key ? `${escapeHtml(row.queue_position ?? '—')} / ${escapeHtml(row.queue_wait_ms ?? 0)} ms` : '—'}</td>
                         <td>${escapeHtml(row.client || '—')}</td>
                         <td>${row.duration_ms == null ? '—' : `${row.duration_ms} ms`}</td>
                         <td>${escapeHtml(row.upstream || '—')}</td>
@@ -528,6 +565,10 @@ def _path_only(path: str) -> str:
     parsed = urllib.parse.urlsplit(path)
     normalized = parsed.path.rstrip("/")
     return normalized or "/"
+
+
+def _queue_key_for_backend(host: str, port: int, scheme: str) -> str:
+    return f"{scheme}://{host}:{port}"
 
 
 def _backend_for_model(model_name: str | None) -> tuple[str, int, str]:
@@ -689,6 +730,135 @@ def _inc_counter(bucket: dict, key: str, value: int = 1) -> None:
     bucket[key] = int(bucket.get(key, 0)) + value
 
 
+def _queue_state(queue_key: str) -> dict:
+    state = QUEUE_STATES.get(queue_key)
+    if state is None:
+        state = {
+            "active": False,
+            "active_model": None,
+            "active_since": None,
+            "waiting": deque(),
+            "queued_total": 0,
+            "completed_total": 0,
+            "full_total": 0,
+            "timeout_total": 0,
+            "last_wait_ms": 0,
+            "total_wait_ms": 0,
+        }
+        QUEUE_STATES[queue_key] = state
+    return state
+
+
+def _acquire_model_slot(queue_key: str, model: str | None, client: str) -> dict:
+    started = time.time()
+    entry = {
+        "token": object(),
+        "model": model,
+        "client": client,
+        "enqueued_at": started,
+    }
+    with QUEUE_LOCK:
+        state = _queue_state(queue_key)
+        if not state["active"] and not state["waiting"]:
+            state["active"] = True
+            state["active_model"] = model
+            state["active_since"] = time.time()
+            return {
+                "ok": True,
+                "queue_key": queue_key,
+                "initial_position": 0,
+                "wait_ms": 0,
+            }
+
+        waiting = state["waiting"]
+        initial_position = len(waiting) + 1
+        if len(waiting) >= MODEL_QUEUE_MAX_SIZE:
+            state["full_total"] += 1
+            return {
+                "ok": False,
+                "error": "queue_full",
+                "queue_key": queue_key,
+                "initial_position": initial_position,
+                "wait_ms": 0,
+                "waiting": len(waiting),
+            }
+
+        waiting.append(entry)
+        state["queued_total"] += 1
+        deadline = started + MODEL_QUEUE_TIMEOUT
+
+        while True:
+            if waiting and waiting[0] is entry and not state["active"]:
+                waiting.popleft()
+                state["active"] = True
+                state["active_model"] = model
+                state["active_since"] = time.time()
+                wait_ms = int((time.time() - started) * 1000)
+                state["last_wait_ms"] = wait_ms
+                state["total_wait_ms"] += wait_ms
+                return {
+                    "ok": True,
+                    "queue_key": queue_key,
+                    "initial_position": initial_position,
+                    "wait_ms": wait_ms,
+                }
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                try:
+                    waiting.remove(entry)
+                except ValueError:
+                    pass
+                state["timeout_total"] += 1
+                QUEUE_LOCK.notify_all()
+                return {
+                    "ok": False,
+                    "error": "queue_timeout",
+                    "queue_key": queue_key,
+                    "initial_position": initial_position,
+                    "wait_ms": int((time.time() - started) * 1000),
+                    "waiting": len(waiting),
+                }
+
+            QUEUE_LOCK.wait(remaining)
+
+
+def _release_model_slot(queue_key: str) -> None:
+    with QUEUE_LOCK:
+        state = _queue_state(queue_key)
+        state["active"] = False
+        state["active_model"] = None
+        state["active_since"] = None
+        state["completed_total"] += 1
+        QUEUE_LOCK.notify_all()
+
+
+def _queue_snapshot() -> list[dict]:
+    now = time.time()
+    with QUEUE_LOCK:
+        rows: list[dict] = []
+        for queue_key, state in sorted(QUEUE_STATES.items()):
+            waiting = list(state["waiting"])
+            completed = max(1, int(state["completed_total"]))
+            rows.append({
+                "queue_key": queue_key,
+                "active": bool(state["active"]),
+                "active_model": state["active_model"],
+                "active_seconds": int(now - state["active_since"]) if state["active_since"] else 0,
+                "waiting": len(waiting),
+                "waiting_models": [entry.get("model") for entry in waiting[:10]],
+                "max_queue_size": MODEL_QUEUE_MAX_SIZE,
+                "timeout_seconds": MODEL_QUEUE_TIMEOUT,
+                "queued_total": state["queued_total"],
+                "completed_total": state["completed_total"],
+                "full_total": state["full_total"],
+                "timeout_total": state["timeout_total"],
+                "last_wait_ms": state["last_wait_ms"],
+                "avg_wait_ms": int(state["total_wait_ms"] / completed),
+            })
+        return rows
+
+
 def _record_request_stat(
     *,
     path: str,
@@ -698,6 +868,9 @@ def _record_request_stat(
     duration_ms: int | None = None,
     upstream: str | None = None,
     error: str | None = None,
+    queue_key: str | None = None,
+    queue_position: int | None = None,
+    queue_wait_ms: int | None = None,
 ) -> None:
     ts = time.time()
     with STATS_LOCK:
@@ -716,6 +889,9 @@ def _record_request_stat(
             "client": client,
             "duration_ms": duration_ms,
             "upstream": upstream,
+            "queue_key": queue_key,
+            "queue_position": queue_position,
+            "queue_wait_ms": queue_wait_ms,
         })
         del recent[:-30]
         if error:
@@ -925,6 +1101,7 @@ def _build_dashboard_payload() -> dict:
         },
         "published_models": published_models,
         "backends": backends,
+        "queues": _queue_snapshot(),
         "stats": stats,
     }
 
@@ -1086,10 +1263,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     # ---- Helpers --------------------------------------------------------
 
-    def _send_json(self, code: int, payload: dict):
+    def _send_json(self, code: int, payload: dict, headers: dict[str, str] | None = None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -1553,8 +1732,56 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # body not valid JSON — leave as-is
 
-        # 5. Send request to vLLM backend
+        # 5. Wait for this physical backend's single active slot.
+        queue_key = _queue_key_for_backend(host, port, scheme)
+        queue_info = _acquire_model_slot(queue_key, effective_model, self._client_label())
+        if not queue_info.get("ok"):
+            error_code = queue_info["error"]
+            if error_code == "queue_full":
+                payload = {
+                    "error": "queue_full",
+                    "message": (
+                        "Модель сейчас занята, а очередь заполнена. "
+                        "Повторите запрос позже или уменьшите параллелизм клиента."
+                    ),
+                    "model": effective_model,
+                    "queue_key": queue_key,
+                    "queue_position": queue_info["initial_position"],
+                    "max_queue_size": MODEL_QUEUE_MAX_SIZE,
+                    "retry_after_seconds": int(MODEL_QUEUE_TIMEOUT),
+                }
+            else:
+                payload = {
+                    "error": "queue_timeout",
+                    "message": (
+                        "Запрос слишком долго ожидал свободного слота модели. "
+                        "Повторите запрос позже или уменьшите параллелизм клиента."
+                    ),
+                    "model": effective_model,
+                    "queue_key": queue_key,
+                    "queue_position": queue_info["initial_position"],
+                    "waited_seconds": round(queue_info["wait_ms"] / 1000, 3),
+                    "timeout_seconds": MODEL_QUEUE_TIMEOUT,
+                }
+            self._send_json(503, payload, headers={"Retry-After": str(int(MODEL_QUEUE_TIMEOUT))})
+            _record_request_stat(
+                path=path_only,
+                status=503,
+                model=effective_model,
+                client=self._client_label(),
+                duration_ms=int((time.time() - started) * 1000),
+                upstream=f"{scheme}://{host}:{port}",
+                error=error_code,
+                queue_key=queue_key,
+                queue_position=queue_info["initial_position"],
+                queue_wait_ms=queue_info["wait_ms"],
+            )
+            return
+
+        # 6. Send request to vLLM backend
         conn = _make_connection(host, port, timeout=3600, scheme=scheme)
+        slot_acquired = True
+        resp = None
         fwd = self._fwd_headers(host, port, body)
         try:
             conn.request(self.command, self.path, body=body or None, headers=fwd)
@@ -1562,6 +1789,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(502, {"error": "backend_unreachable", "message": str(exc)})
             conn.close()
+            if slot_acquired:
+                _release_model_slot(queue_key)
             _record_request_stat(
                 path=path_only,
                 status=502,
@@ -1570,14 +1799,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 duration_ms=int((time.time() - started) * 1000),
                 upstream=f"{scheme}://{host}:{port}",
                 error=str(exc),
+                queue_key=queue_key,
+                queue_position=queue_info["initial_position"],
+                queue_wait_ms=queue_info["wait_ms"],
             )
             return
 
-        # 6. Detect streaming response (SSE)
+        # 7. Detect streaming response (SSE)
         content_type = resp.getheader("Content-Type", "")
         is_stream    = "text/event-stream" in content_type
 
-        # 7. Relay response headers
+        # 8. Relay response headers
         self.send_response(resp.status)
         for name, value in resp.getheaders():
             if name.lower() in HOP_BY_HOP:
@@ -1585,13 +1817,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if name.lower() == "content-length" and is_stream:
                 continue
             self.send_header(name, value)
+        self.send_header("X-Gateway-Queue-Key", queue_key)
+        self.send_header("X-Gateway-Queue-Initial-Position", str(queue_info["initial_position"]))
+        self.send_header("X-Gateway-Queue-Wait-Ms", str(queue_info["wait_ms"]))
         if is_stream:
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
         self.end_headers()
 
-        # 8. Relay body
+        # 9. Relay body
         try:
             if is_stream:
                 if needs_think_embed:
@@ -1610,8 +1845,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            resp.close()
+            if resp is not None:
+                resp.close()
             conn.close()
+            if slot_acquired:
+                _release_model_slot(queue_key)
 
         _record_request_stat(
             path=path_only,
@@ -1621,6 +1859,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             duration_ms=int((time.time() - started) * 1000),
             upstream=f"{scheme}://{host}:{port}",
             error=None if resp.status < 400 else f"upstream_http_{resp.status}",
+            queue_key=queue_key,
+            queue_position=queue_info["initial_position"],
+            queue_wait_ms=queue_info["wait_ms"],
         )
 
         self.close_connection = True
