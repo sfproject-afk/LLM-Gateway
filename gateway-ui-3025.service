@@ -1,0 +1,22 @@
+[Unit]
+Description=External LLM Gateway Manager UI on port 3025
+After=network-online.target model-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/model-gateway
+
+Environment="GATEWAY_UI_HOST=0.0.0.0"
+Environment="GATEWAY_UI_PORT=3025"
+Environment="GATEWAY_UI_UPSTREAM_HOST=127.0.0.1"
+Environment="GATEWAY_UI_UPSTREAM_PORT=8080"
+Environment="GATEWAY_UI_STATIC_ROOT=/path/to/model-gateway/manager-ui/dist"
+
+ExecStart=/usr/bin/python3 /path/to/model-gateway/scripts/gateway-ui-proxy.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

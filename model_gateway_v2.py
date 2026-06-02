@@ -21,6 +21,7 @@ Environment variables:
 import http.client
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -129,6 +130,11 @@ STREAM_CHUNK = 8 * 1024
 MODEL_QUEUE_MAX_SIZE = int(os.environ.get("MODEL_QUEUE_MAX_SIZE", "5"))
 MODEL_QUEUE_TIMEOUT = float(os.environ.get("MODEL_QUEUE_TIMEOUT", "60"))
 
+MANAGER_PIN = os.environ.get("MODEL_GATEWAY_MANAGER_PIN", "2064564")
+MANAGER_PIN_MAX_ATTEMPTS = int(os.environ.get("MODEL_GATEWAY_MANAGER_PIN_MAX_ATTEMPTS", "3"))
+MANAGER_PIN_BAN_SECONDS = int(os.environ.get("MODEL_GATEWAY_MANAGER_PIN_BAN_SECONDS", "1800"))
+MANAGER_SESSION_TTL = int(os.environ.get("MODEL_GATEWAY_MANAGER_SESSION_TTL", "43200"))
+
 # Thinking-model config: control reasoning/thinking behaviour per model.
 # THINKING_MODELS — comma-separated model names that support thinking mode.
 # THINKING_BUDGET  — controls thinking injection:
@@ -168,10 +174,14 @@ GATEWAY_STATS = {
         "recent_requests": [],
         "recent_errors": [],
         "last_request_ts": None,
+        "load_buckets": {},
 }
 
 QUEUE_LOCK = threading.Condition()
 QUEUE_STATES: dict[str, dict] = {}
+MANAGER_AUTH_LOCK = threading.Lock()
+MANAGER_PIN_FAILURES: dict[str, dict] = {}
+MANAGER_SESSIONS: dict[str, dict] = {}
 
 MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -182,46 +192,210 @@ MANAGER_HTML = """<!DOCTYPE html>
     <style>
         :root {
             color-scheme: dark;
-            --bg: #0b1020;
-            --panel: #121933;
-            --panel-2: #1a2345;
-            --text: #e7ecff;
-            --muted: #9aa7d1;
-            --accent: #6ea8fe;
-            --good: #30c48d;
-            --warn: #f6c760;
-            --bad: #ff6b6b;
-            --border: rgba(255,255,255,0.08);
+            --background: 240 10% 3.9%;
+            --foreground: 0 0% 98%;
+            --muted: 240 3.7% 15.9%;
+            --muted-foreground: 240 5% 64.9%;
+            --card: 240 10% 3.9%;
+            --card-foreground: 0 0% 98%;
+            --popover: 240 10% 3.9%;
+            --popover-foreground: 0 0% 98%;
+            --border: 240 3.7% 15.9%;
+            --input: 240 3.7% 15.9%;
+            --primary: 142.1 76.2% 36.3%;
+            --primary-foreground: 0 0% 98%;
+            --secondary: 240 3.7% 15.9%;
+            --secondary-foreground: 0 0% 98%;
+            --destructive: 0 62.8% 30.6%;
+            --destructive-foreground: 0 0% 98%;
+            --ring: 142.1 76.2% 36.3%;
+            --radius: 0.5rem;
+            --success: 142.1 70.6% 45.3%;
+            --warning: 47.9 95.8% 53.1%;
+            --sigma-green: #00db4d;
+            --shell: rgba(7, 10, 14, .72);
+            --panel: rgba(13, 17, 23, .58);
+            --hairline: rgba(255,255,255,.08);
+            --text-soft: rgba(244,244,245,.72);
         }
         * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
         body {
             margin: 0;
-            font-family: Inter, system-ui, sans-serif;
-            background: linear-gradient(180deg, #0a0f1f 0%, #111936 100%);
-            color: var(--text);
+            min-height: 100vh;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 14px;
+            line-height: 1.45;
+            background:
+                radial-gradient(circle at 82% 18%, rgba(115, 91, 105, .42), transparent 28rem),
+                radial-gradient(circle at 8% 74%, rgba(0, 92, 106, .34), transparent 34rem),
+                linear-gradient(180deg, #080b10 0%, #05070a 100%);
+            color: hsl(var(--foreground));
         }
-        .wrap {
-            max-width: 1380px;
-            margin: 0 auto;
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(90deg, rgba(0,0,0,.52), transparent 34%, rgba(0,0,0,.42)),
+                repeating-linear-gradient(0deg, rgba(255,255,255,.018), rgba(255,255,255,.018) 1px, transparent 1px, transparent 43px);
+        }
+        body.locked .topbar,
+        body.locked .app-shell { display: none; }
+        a { color: inherit; text-decoration: none; }
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            height: 48px;
+            display: grid;
+            grid-template-columns: 280px minmax(0, 1fr) 280px;
+            align-items: center;
+            border-bottom: 1px solid var(--hairline);
+            background: rgba(8, 10, 14, .76);
+            backdrop-filter: blur(18px);
+        }
+        .brand {
+            height: 48px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 0 20px;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: .01em;
+        }
+        .brand-mark {
+            width: 22px;
+            height: 22px;
+            display: inline-grid;
+            place-items: center;
+            border: 1px solid rgba(255,255,255,.24);
+            background: rgba(255,255,255,.06);
+            clip-path: polygon(50% 0, 100% 26%, 100% 74%, 50% 100%, 0 74%, 0 26%);
+            color: var(--sigma-green);
+            font-size: 12px;
+        }
+        .top-nav {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            color: hsl(var(--muted-foreground));
+            font-size: 12px;
+        }
+        .top-nav .active {
+            color: hsl(var(--foreground));
+            font-weight: 600;
+        }
+        .top-actions {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 8px;
+            padding: 0 18px;
+        }
+        .app-shell {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: 280px minmax(0, 760px) 280px;
+            justify-content: center;
+            min-height: calc(100vh - 48px);
+        }
+        .sidebar,
+        .toc {
+            position: sticky;
+            top: 48px;
+            height: calc(100vh - 48px);
+            overflow: auto;
+            padding: 18px 18px 28px;
+            color: hsl(var(--muted-foreground));
+            background: rgba(5, 9, 13, .24);
+        }
+        .sidebar { border-right: 1px solid var(--hairline); }
+        .toc { border-left: 1px solid var(--hairline); }
+        .green-strip {
+            height: 22px;
+            margin: -2px 0 14px;
+            border: 1px solid rgba(0,219,77,.22);
+            background: linear-gradient(90deg, rgba(0,219,77,.78), rgba(0,219,77,.28));
+            box-shadow: 0 0 22px rgba(0,219,77,.22);
+        }
+        .nav-group { margin: 0 0 18px; }
+        .nav-title,
+        .toc-title {
+            margin: 0 0 9px;
+            color: hsl(var(--foreground));
+            font-size: 12px;
+            font-weight: 650;
+        }
+        .nav-link,
+        .toc a {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 24px;
+            padding: 3px 10px;
+            border-left: 1px solid transparent;
+            color: hsl(var(--muted-foreground));
+            font-size: 12px;
+        }
+        .nav-link.active {
+            color: hsl(var(--foreground));
+            border-left-color: var(--sigma-green);
+            background: linear-gradient(90deg, rgba(0,219,77,.12), transparent);
+        }
+        .nav-count {
+            color: rgba(244,244,245,.46);
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 11px;
+        }
+        .content {
+            min-width: 0;
+            padding: 38px 24px 80px;
+        }
+        .page-kicker {
+            margin: 0 0 10px;
+            color: hsl(var(--muted-foreground));
+            font-size: 12px;
+        }
+        .page-head {
+            margin-bottom: 28px;
+            padding-bottom: 22px;
+            border-bottom: 1px solid var(--hairline);
+        }
+        .page-head h1 {
+            margin: 0;
+            font-size: 31px;
+            line-height: 1.08;
+            letter-spacing: 0;
+        }
+        .page-head p {
+            max-width: 680px;
+            margin: 8px 0 0;
+            color: hsl(var(--muted-foreground));
+        }
+        .login-shell {
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
             padding: 24px;
         }
-        .hero {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            align-items: center;
-            gap: 16px;
-            margin-bottom: 20px;
+        body.unlocked .login-shell { display: none; }
+        .login-card {
+            width: min(420px, 100%);
+            position: relative;
+            z-index: 1;
+            background: var(--shell);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: 0 24px 90px rgba(0,0,0,0.45);
+            backdrop-filter: blur(18px);
         }
-        .hero h1 {
-            margin: 0;
-            font-size: 32px;
-            line-height: 1.1;
-        }
-        .hero p {
-            margin: 8px 0 0;
-            color: var(--muted);
-        }
+        .login-card h1 { margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }
+        .login-card p { margin: 0 0 18px; color: hsl(var(--muted-foreground)); line-height: 1.5; }
         .toolbar {
             display: flex;
             gap: 10px;
@@ -229,40 +403,60 @@ MANAGER_HTML = """<!DOCTYPE html>
             align-items: center;
         }
         input, button {
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            background: var(--panel);
-            color: var(--text);
-            padding: 12px 14px;
+            border-radius: var(--radius);
+            border: 1px solid hsl(var(--input));
+            background: rgba(13, 17, 23, .7);
+            color: hsl(var(--foreground));
+            padding: 8px 11px;
             font: inherit;
+            font-size: 12px;
         }
-        input { min-width: 320px; }
+        input:focus { outline: 2px solid hsl(var(--ring) / .35); outline-offset: 2px; }
+        input { min-width: 280px; }
         button {
             cursor: pointer;
-            background: linear-gradient(180deg, #2e4b91, #243b73);
-            border: none;
-            min-width: 140px;
+            min-width: 0;
+            background: rgba(255,255,255,.92);
+            border-color: rgba(255,255,255,.92);
+            color: #09090b;
+            font-weight: 600;
+        }
+        button.secondary {
+            background: rgba(13, 17, 23, .45);
+            border-color: var(--hairline);
+            color: hsl(var(--foreground));
         }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+            gap: 1px;
             margin-bottom: 18px;
+            overflow: hidden;
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            background: var(--hairline);
         }
         .card {
-            background: rgba(18,25,51,0.9);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 18px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+            background: var(--panel);
+            border: 1px solid var(--hairline);
+            border-radius: calc(var(--radius) - 2px);
+            padding: 15px;
+            box-shadow: none;
+            backdrop-filter: blur(12px);
         }
-        .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
-        .value { font-size: 30px; font-weight: 700; }
+        .grid > .card,
+        .grid > div {
+            border: 0;
+            border-radius: 0;
+            background: rgba(13,17,23,.56);
+        }
+        .label { color: hsl(var(--muted-foreground)); font-size: 12px; margin-bottom: 6px; }
+        .value { font-size: 24px; font-weight: 680; letter-spacing: 0; }
         .section {
-            margin-top: 18px;
+            margin-top: 24px;
             display: grid;
             grid-template-columns: 1.1fr 1fr;
-            gap: 18px;
+            gap: 16px;
         }
         .section.single { grid-template-columns: 1fr; }
         .panel-title {
@@ -271,47 +465,80 @@ MANAGER_HTML = """<!DOCTYPE html>
             align-items: center;
             margin-bottom: 12px;
             gap: 12px;
+            padding-bottom: 11px;
+            border-bottom: 1px solid var(--hairline);
         }
         .panel-title h2 {
             margin: 0;
             font-size: 18px;
+            letter-spacing: 0;
         }
         .pill {
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            padding: 5px 10px;
-            border-radius: 999px;
-            background: rgba(255,255,255,0.06);
-            color: var(--muted);
-            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 6px;
+            background: rgba(39, 45, 54, .74);
+            color: hsl(var(--secondary-foreground));
+            font-size: 11px;
+            border: 1px solid var(--hairline);
         }
-        .status-online { color: var(--good); }
-        .status-offline { color: var(--bad); }
-        .status-disabled { color: var(--warn); }
+        .status-online { color: hsl(var(--success)); }
+        .status-offline { color: hsl(var(--destructive)); }
+        .status-disabled { color: hsl(var(--warning)); }
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
+            font-size: 12px;
         }
         th, td {
-            padding: 10px 8px;
-            border-bottom: 1px solid var(--border);
+            padding: 9px 8px;
+            border-bottom: 1px solid var(--hairline);
             text-align: left;
             vertical-align: top;
         }
-        th { color: var(--muted); font-weight: 600; }
+        th { color: hsl(var(--muted-foreground)); font-weight: 650; }
+        tbody tr:hover { background: rgba(255,255,255,.025); }
         .mono { font-family: ui-monospace, SFMono-Regular, monospace; }
         .tag {
             display: inline-block;
-            padding: 4px 8px;
-            border-radius: 8px;
-            background: rgba(110,168,254,0.14);
-            color: #b9d2ff;
-            font-size: 12px;
+            padding: 2px 6px;
+            border-radius: 5px;
+            background: rgba(39,45,54,.7);
+            color: hsl(var(--secondary-foreground));
+            font-size: 11px;
             margin-right: 6px;
+            border: 1px solid var(--hairline);
         }
-        .muted { color: var(--muted); }
+        .muted { color: hsl(var(--muted-foreground)); }
+        .hidden { display: none !important; }
+        .metric-sub { margin-top: 6px; color: hsl(var(--muted-foreground)); font-size: 12px; }
+        .chart {
+            display: flex;
+            align-items: end;
+            gap: 3px;
+            height: 120px;
+            padding-top: 12px;
+            border-top: 1px solid var(--hairline);
+        }
+        .bar {
+            flex: 1;
+            min-width: 3px;
+            background: linear-gradient(180deg, rgba(0,219,77,.95), rgba(0,219,77,.32));
+            border-radius: 2px 2px 0 0;
+            opacity: .9;
+        }
+        .bar.err { background: hsl(var(--destructive)); }
+        .queue-meter {
+            height: 8px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: rgba(39,45,54,.8);
+            border: 1px solid var(--hairline);
+            margin-top: 8px;
+        }
+        .queue-meter > span { display: block; height: 100%; background: var(--sigma-green); }
         .error-box {
             white-space: pre-wrap;
             background: rgba(255,107,107,0.08);
@@ -320,38 +547,116 @@ MANAGER_HTML = """<!DOCTYPE html>
             border-radius: 12px;
             color: #ffd0d0;
         }
-        @media (max-width: 980px) {
+        @media (max-width: 1180px) {
+            .topbar { grid-template-columns: 220px 1fr auto; }
+            .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
+            .toc { display: none; }
+        }
+        @media (max-width: 820px) {
+            .topbar { grid-template-columns: 1fr auto; }
+            .top-nav { display: none; }
+            .brand { padding-left: 14px; }
+            .app-shell { display: block; }
+            .sidebar { display: none; }
+            .content { padding: 26px 14px 56px; }
             .section { grid-template-columns: 1fr; }
             input { min-width: 0; width: 100%; }
             .toolbar { width: 100%; }
+            .top-actions .toolbar { width: auto; }
         }
     </style>
 </head>
-<body>
-    <div class="wrap">
-        <div class="hero">
-            <div>
-                <h1>LLM Gateway Manager</h1>
-                <p>Статистика, модели, состояние backend'ов и статус загрузки в одном окне.</p>
+<body class="locked">
+    <div class="login-shell">
+        <form id="pinForm" class="login-card">
+            <h1>LLM Gateway Manager</h1>
+            <p>Введите PIN-код для доступа к панели загрузки, статистики и очередей.</p>
+            <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN-код" />
+            <div class="toolbar" style="margin-top:12px;">
+                <button type="submit">Войти</button>
             </div>
+            <div id="pinMessage" class="metric-sub"></div>
+        </form>
+    </div>
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark">S</span>
+            <span>SIGMA-UI</span>
+        </div>
+        <nav class="top-nav" aria-label="Top navigation">
+            <a href="#overview">Home</a>
+            <a href="#load">Docs</a>
+            <a class="active" href="#queues">Components</a>
+            <a href="#stats">Blocks <span class="pill">Alpha</span></a>
+            <a href="#errors">Changelog <span class="pill">v2</span></a>
+        </nav>
+        <div class="top-actions">
             <div class="toolbar">
-                <input id="tokenInput" type="password" placeholder="Bearer token для manager API" />
-                <button id="saveBtn">Сохранить токен</button>
-                <button id="refreshBtn">Обновить</button>
+                <button id="refreshBtn" class="secondary">Refresh</button>
+                <button id="logoutBtn" class="secondary">Logout</button>
+            </div>
+        </div>
+    </header>
+
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="green-strip"></div>
+            <div class="nav-group">
+                <p class="nav-title">Config options</p>
+                <a class="nav-link active" href="#overview">gateway <span class="nav-count">live</span></a>
+                <a class="nav-link" href="#load">load <span class="nav-count">60m</span></a>
+                <a class="nav-link" href="#queues">queue <span class="nav-count">1x</span></a>
+            </div>
+            <div class="nav-group">
+                <p class="nav-title">Components</p>
+                <a class="nav-link" href="#backends">Backend status</a>
+                <a class="nav-link" href="#models">Published models</a>
+                <a class="nav-link" href="#stats">Recent requests</a>
+                <a class="nav-link" href="#errors">Recent errors</a>
+            </div>
+            <div class="nav-group">
+                <p class="nav-title">Instructions</p>
+                <div class="nav-link">PIN attempts <span class="nav-count">3</span></div>
+                <div class="nav-link">Ban window <span class="nav-count">30m</span></div>
+                <div class="nav-link">Per model <span class="nav-count">1 active</span></div>
+            </div>
+        </aside>
+
+        <main class="content">
+            <header id="overview" class="page-head">
+                <p class="page-kicker">Gateway manager</p>
+                <h1>LLM Gateway</h1>
+                <p>Загрузка, историческая статистика, backend status и очередь запросов в темной теме Sigma UI.</p>
+            </header>
+
+            <div id="summary" class="grid"></div>
+
+        <div id="load" class="section">
+            <div class="card">
+                <div class="panel-title">
+                    <h2>Текущая загрузка</h2>
+                    <span class="pill" id="loadNow">—</span>
+                </div>
+                <div id="loadPanel"></div>
+            </div>
+            <div class="card">
+                <div class="panel-title">
+                    <h2>Историческая загрузка</h2>
+                    <span class="pill">last 60m</span>
+                </div>
+                <div id="loadChart"></div>
             </div>
         </div>
 
-        <div id="summary" class="grid"></div>
-
         <div class="section">
-            <div class="card">
+            <div id="backends" class="card">
                 <div class="panel-title">
                     <h2>Backend статус</h2>
                     <span class="pill" id="lastRefresh">—</span>
                 </div>
                 <div id="backendTable"></div>
             </div>
-            <div class="card">
+            <div id="models" class="card">
                 <div class="panel-title">
                     <h2>Публикуемые модели</h2>
                     <span class="pill" id="publishedCount">0</span>
@@ -360,7 +665,7 @@ MANAGER_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section single">
+        <div id="stats" class="section single">
             <div class="card">
                 <div class="panel-title">
                     <h2>Последние запросы</h2>
@@ -370,7 +675,7 @@ MANAGER_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section single">
+        <div id="queues" class="section single">
             <div class="card">
                 <div class="panel-title">
                     <h2>Очереди</h2>
@@ -380,7 +685,7 @@ MANAGER_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section single">
+        <div id="errors" class="section single">
             <div class="card">
                 <div class="panel-title">
                     <h2>Последние ошибки</h2>
@@ -389,22 +694,43 @@ MANAGER_HTML = """<!DOCTYPE html>
                 <div id="errorsBox" class="muted">Ошибок пока нет.</div>
             </div>
         </div>
+        </main>
+
+        <aside class="toc">
+            <p class="toc-title">Table of content</p>
+            <a href="#overview">Overview</a>
+            <a href="#load">Load</a>
+            <a href="#backends">Backends</a>
+            <a href="#models">Models</a>
+            <a href="#stats">Statistics</a>
+            <a href="#queues">Queue</a>
+            <a href="#errors">Errors</a>
+            <div class="nav-group" style="margin-top:24px;">
+                <p class="toc-title">Queue rules</p>
+                <div class="nav-link">1 active request</div>
+                <div class="nav-link">others wait</div>
+                <div class="nav-link">position in headers</div>
+            </div>
+        </aside>
     </div>
 
     <script>
-        const tokenInput = document.getElementById('tokenInput');
-        const saveBtn = document.getElementById('saveBtn');
+        const pinForm = document.getElementById('pinForm');
+        const pinInput = document.getElementById('pinInput');
+        const pinMessage = document.getElementById('pinMessage');
         const refreshBtn = document.getElementById('refreshBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
         const summary = document.getElementById('summary');
         const backendTable = document.getElementById('backendTable');
         const modelTable = document.getElementById('modelTable');
         const recentTable = document.getElementById('recentTable');
         const queueTable = document.getElementById('queueTable');
+        const loadPanel = document.getElementById('loadPanel');
+        const loadChart = document.getElementById('loadChart');
+        const loadNow = document.getElementById('loadNow');
         const errorsBox = document.getElementById('errorsBox');
         const lastRefresh = document.getElementById('lastRefresh');
         const publishedCount = document.getElementById('publishedCount');
-
-        tokenInput.value = localStorage.getItem('gateway_manager_token') || '';
 
         function fmtTime(ts) {
             if (!ts) return '—';
@@ -418,16 +744,74 @@ MANAGER_HTML = """<!DOCTYPE html>
                 .replaceAll('>', '&gt;');
         }
 
+        function setLocked(locked, message = '') {
+            document.body.classList.toggle('locked', locked);
+            document.body.classList.toggle('unlocked', !locked);
+            pinMessage.textContent = message;
+            if (locked) setTimeout(() => pinInput.focus(), 50);
+        }
+
+        function sum(values, key) {
+            return values.reduce((acc, row) => acc + Number(row[key] || 0), 0);
+        }
+
+        function renderBars(buckets) {
+            const rows = (buckets || []).slice(-60);
+            const max = Math.max(1, ...rows.map(row => Number(row.total || 0)));
+            loadChart.innerHTML = `
+                <div class="chart" title="Requests per minute">
+                    ${rows.map(row => {
+                        const h = Math.max(4, Math.round((Number(row.total || 0) / max) * 110));
+                        const cls = Number(row.errors || 0) ? 'bar err' : 'bar';
+                        return `<span class="${cls}" style="height:${h}px" title="${fmtTime(row.ts)} — ${escapeHtml(row.total)} req, ${escapeHtml(row.errors)} errors"></span>`;
+                    }).join('') || '<div class="muted">Истории пока нет.</div>'}
+                </div>
+            `;
+        }
+
+        function renderLoad(data) {
+            const queues = data.queues || [];
+            const buckets = data.stats.load_buckets || [];
+            const last = buckets[buckets.length - 1] || {};
+            const active = queues.filter(row => row.active).length;
+            const waiting = sum(queues, 'waiting');
+            const errors = Number(last.errors || 0);
+            loadNow.textContent = `${active} active / ${waiting} waiting`;
+            loadPanel.innerHTML = `
+                <div class="grid" style="margin-bottom:0;">
+                    <div>
+                        <div class="label">Requests this minute</div>
+                        <div class="value">${escapeHtml(last.total || 0)}</div>
+                        <div class="metric-sub">${escapeHtml(errors)} errors</div>
+                    </div>
+                    <div>
+                        <div class="label">Active backends</div>
+                        <div class="value">${escapeHtml(active)}</div>
+                        <div class="metric-sub">${escapeHtml(waiting)} waiting</div>
+                    </div>
+                    <div>
+                        <div class="label">Queue rejects</div>
+                        <div class="value">${escapeHtml(sum(queues, 'full_total'))}</div>
+                        <div class="metric-sub">${escapeHtml(sum(queues, 'timeout_total'))} timeouts</div>
+                    </div>
+                </div>
+            `;
+            renderBars(buckets);
+        }
+
         async function loadDashboard() {
-            const token = tokenInput.value.trim();
-            const headers = token ? { Authorization: `Bearer ${token}` } : {};
             try {
-                const res = await fetch('/manager/api/dashboard', { headers });
+                const res = await fetch('/manager/api/dashboard', { credentials: 'same-origin' });
                 if (!res.ok) {
+                    if (res.status === 401) {
+                        setLocked(true, 'Введите PIN-код.');
+                        return;
+                    }
                     const text = await res.text();
                     throw new Error(`HTTP ${res.status}: ${text}`);
                 }
                 const data = await res.json();
+                setLocked(false);
                 renderDashboard(data);
             } catch (err) {
                 summary.innerHTML = `<div class="card error-box">${escapeHtml(err.message)}</div>`;
@@ -453,6 +837,7 @@ MANAGER_HTML = """<!DOCTYPE html>
                     <div class="value">${escapeHtml(value)}</div>
                 </div>
             `).join('');
+            renderLoad(data);
 
             lastRefresh.textContent = `refresh ${new Date().toLocaleTimeString('ru-RU')}`;
             publishedCount.textContent = String(data.published_models.length);
@@ -489,7 +874,7 @@ MANAGER_HTML = """<!DOCTYPE html>
                     <tr>
                         <td class="mono">${escapeHtml(row.queue_key)}</td>
                         <td>${row.active ? `<span class="tag">${escapeHtml(row.active_model || 'active')}</span> ${escapeHtml(row.active_seconds || 0)}s` : '—'}</td>
-                        <td>${escapeHtml(row.waiting)}</td>
+                        <td>${escapeHtml(row.waiting)}<div class="queue-meter"><span style="width:${Math.min(100, (Number(row.waiting || 0) / Math.max(1, Number(row.max_queue_size || 1))) * 100)}%"></span></div></td>
                         <td>${escapeHtml(row.max_queue_size)} / ${escapeHtml(row.timeout_seconds)}s</td>
                         <td>${escapeHtml(row.last_wait_ms || 0)} ms</td>
                         <td>${escapeHtml(row.avg_wait_ms || 0)} ms</td>
@@ -525,9 +910,32 @@ MANAGER_HTML = """<!DOCTYPE html>
             }
         }
 
-        saveBtn.addEventListener('click', () => {
-            localStorage.setItem('gateway_manager_token', tokenInput.value.trim());
-            loadDashboard();
+        pinForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            pinMessage.textContent = 'Проверяю PIN...';
+            try {
+                const res = await fetch('/manager/api/login', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pin: pinInput.value.trim() }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    pinInput.value = '';
+                    pinMessage.textContent = data.message || `HTTP ${res.status}`;
+                    return;
+                }
+                pinInput.value = '';
+                setLocked(false);
+                loadDashboard();
+            } catch (err) {
+                pinMessage.textContent = err.message;
+            }
+        });
+        logoutBtn.addEventListener('click', async () => {
+            await fetch('/manager/api/logout', { method: 'POST', credentials: 'same-origin' });
+            setLocked(true, 'Сессия закрыта.');
         });
         refreshBtn.addEventListener('click', loadDashboard);
         loadDashboard();
@@ -873,6 +1281,7 @@ def _record_request_stat(
     queue_wait_ms: int | None = None,
 ) -> None:
     ts = time.time()
+    bucket_ts = int(ts // 60) * 60
     with STATS_LOCK:
         GATEWAY_STATS["total_requests"] += 1
         _inc_counter(GATEWAY_STATS["route_counts"], path)
@@ -880,6 +1289,25 @@ def _record_request_stat(
         if model:
             _inc_counter(GATEWAY_STATS["model_counts"], model)
         GATEWAY_STATS["last_request_ts"] = ts
+        load_buckets = GATEWAY_STATS["load_buckets"]
+        bucket = load_buckets.setdefault(bucket_ts, {
+            "ts": bucket_ts,
+            "total": 0,
+            "ok": 0,
+            "errors": 0,
+            "queued": 0,
+            "queue_wait_ms": 0,
+        })
+        bucket["total"] += 1
+        if status < 400:
+            bucket["ok"] += 1
+        else:
+            bucket["errors"] += 1
+        if queue_key:
+            bucket["queued"] += 1
+            bucket["queue_wait_ms"] += int(queue_wait_ms or 0)
+        for old_ts in sorted(load_buckets)[:-180]:
+            del load_buckets[old_ts]
         recent = GATEWAY_STATS["recent_requests"]
         recent.append({
             "ts": ts,
@@ -1087,6 +1515,7 @@ def _build_dashboard_payload() -> dict:
             "recent_requests": list(GATEWAY_STATS["recent_requests"]),
             "recent_errors": list(GATEWAY_STATS["recent_errors"]),
             "last_request_at": GATEWAY_STATS["last_request_ts"],
+            "load_buckets": [dict(row) for _, row in sorted(GATEWAY_STATS["load_buckets"].items())],
         }
 
     online = sum(1 for row in backends if row["status"] == "online")
@@ -1261,6 +1690,144 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return TOKEN_LABELS.get(auth[7:], "unknown")
         return "anon"
 
+    def _client_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _manager_cookie_token(self) -> str | None:
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "gateway_manager_session" and value:
+                return value
+        return None
+
+    def _manager_authorized(self) -> bool:
+        if self._authorized():
+            return True
+        token = self._manager_cookie_token()
+        if not token:
+            return False
+        now = time.time()
+        with MANAGER_AUTH_LOCK:
+            session = MANAGER_SESSIONS.get(token)
+            if not session:
+                return False
+            if now - session["created_at"] > MANAGER_SESSION_TTL:
+                del MANAGER_SESSIONS[token]
+                return False
+            session["last_seen_at"] = now
+            return True
+
+    def _handle_manager_login(self):
+        started = time.time()
+        ip = self._client_ip()
+        now = time.time()
+        with MANAGER_AUTH_LOCK:
+            failures = MANAGER_PIN_FAILURES.setdefault(ip, {"count": 0, "banned_until": 0})
+            banned_until = float(failures.get("banned_until") or 0)
+            if banned_until > now:
+                retry_after = int(banned_until - now)
+                self._send_json(429, {
+                    "error": "pin_banned",
+                    "message": "Слишком много неверных PIN. Доступ временно заблокирован.",
+                    "retry_after_seconds": retry_after,
+                }, headers={"Retry-After": str(retry_after)})
+                _record_request_stat(
+                    path="/manager/api/login",
+                    status=429,
+                    client=f"pin:{ip}",
+                    duration_ms=int((time.time() - started) * 1000),
+                    upstream="embedded-ui",
+                    error="pin_banned",
+                )
+                return
+
+        body = self._read_request_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+        pin = str(payload.get("pin", ""))
+
+        if not secrets.compare_digest(pin, MANAGER_PIN):
+            with MANAGER_AUTH_LOCK:
+                failures = MANAGER_PIN_FAILURES.setdefault(ip, {"count": 0, "banned_until": 0})
+                failures["count"] = int(failures.get("count") or 0) + 1
+                remaining = max(0, MANAGER_PIN_MAX_ATTEMPTS - failures["count"])
+                headers = {}
+                status = 401
+                error = "invalid_pin"
+                if failures["count"] >= MANAGER_PIN_MAX_ATTEMPTS:
+                    failures["banned_until"] = time.time() + MANAGER_PIN_BAN_SECONDS
+                    headers["Retry-After"] = str(MANAGER_PIN_BAN_SECONDS)
+                    status = 429
+                    error = "pin_banned"
+                self._send_json(status, {
+                    "error": error,
+                    "message": (
+                        "Неверный PIN. Доступ заблокирован на 30 минут."
+                        if status == 429 else
+                        "Неверный PIN. Повторите ввод."
+                    ),
+                    "remaining_attempts": remaining,
+                    "ban_seconds": MANAGER_PIN_BAN_SECONDS if status == 429 else 0,
+                }, headers=headers)
+            _record_request_stat(
+                path="/manager/api/login",
+                status=status,
+                client=f"pin:{ip}",
+                duration_ms=int((time.time() - started) * 1000),
+                upstream="embedded-ui",
+                error=error,
+            )
+            return
+
+        token = secrets.token_urlsafe(32)
+        with MANAGER_AUTH_LOCK:
+            MANAGER_PIN_FAILURES.pop(ip, None)
+            MANAGER_SESSIONS[token] = {
+                "created_at": time.time(),
+                "last_seen_at": time.time(),
+                "ip": ip,
+            }
+        self._send_json(200, {
+            "ok": True,
+            "message": "Доступ открыт.",
+            "session_ttl_seconds": MANAGER_SESSION_TTL,
+        }, headers={
+            "Set-Cookie": (
+                "gateway_manager_session="
+                f"{token}; Path=/manager; Max-Age={MANAGER_SESSION_TTL}; HttpOnly; SameSite=Lax"
+            )
+        })
+        _record_request_stat(
+            path="/manager/api/login",
+            status=200,
+            client=f"pin:{ip}",
+            duration_ms=int((time.time() - started) * 1000),
+            upstream="embedded-ui",
+        )
+
+    def _handle_manager_logout(self):
+        started = time.time()
+        token = self._manager_cookie_token()
+        if token:
+            with MANAGER_AUTH_LOCK:
+                MANAGER_SESSIONS.pop(token, None)
+        self._send_json(200, {"ok": True}, headers={
+            "Set-Cookie": "gateway_manager_session=; Path=/manager; Max-Age=0; HttpOnly; SameSite=Lax"
+        })
+        _record_request_stat(
+            path="/manager/api/logout",
+            status=200,
+            client=f"pin:{self._client_ip()}",
+            duration_ms=int((time.time() - started) * 1000),
+            upstream="embedded-ui",
+        )
+
     # ---- Helpers --------------------------------------------------------
 
     def _send_json(self, code: int, payload: dict, headers: dict[str, str] | None = None):
@@ -1346,10 +1913,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _handle_manager_dashboard(self):
         started = time.time()
-        if not self._authorized():
+        if not self._manager_authorized():
             self._send_json(401, {
                 "error": "unauthorized",
-                "message": "Invalid or missing Bearer token",
+                "message": "Введите PIN-код для доступа к панели gateway.",
             })
             _record_request_stat(
                 path="/manager/api/dashboard",
@@ -1630,6 +2197,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if self.command == "GET" and path_only in {"/", "/manager", "/manager/", "/manager/html"}:
             self._handle_manager_html()
+            return
+
+        if self.command == "POST" and path_only == "/manager/api/login":
+            self._handle_manager_login()
+            return
+
+        if self.command == "POST" and path_only == "/manager/api/logout":
+            self._handle_manager_logout()
             return
 
         if self.command == "GET" and path_only == "/manager/api/dashboard":

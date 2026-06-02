@@ -21,7 +21,7 @@
 - **SSE стриминг** — корректный проксий Server-Sent Events с реал-тайм flush
 - **Встраивание reasoning** — `reasoning_content` → `<think>…</think>` в `delta.content` (опционально)
 - **Image backend** — проксирование запросов генерации изображений на отдельный сервис
-- **Manager UI** — встроенная web-панель со статистикой запросов, списком публикуемых моделей и статусом backend'ов
+- **Manager UI** — Vue/Sigma UI web-панель с PIN-доступом, загрузкой gateway, историей, статистикой и очередями
 - **Безопасный header forwarding** — внешний `Authorization` не проксируется во внутренние backend'ы
 - **Курируемый `/v1/models`** — опрашивает все бэкенды и отдаёт единый список видимых виртуальных моделей для UI
 
@@ -76,8 +76,10 @@ Client / Open WebUI / Agent
 .
 ├── model_gateway_v2.py     # основной HTTP proxy
 ├── model-gateway.service   # пример systemd unit
+├── manager-ui/             # Vue 3 Manager UI на компонентах Sigma UI
 ├── .env.example            # шаблон конфигурации
 ├── scripts/
+│   ├── gateway-ui-proxy.py # внешний UI server/proxy для порта 3025
 │   └── smoke_test.sh       # быстрый smoke test для /v1/models и /v1/chat/completions
 └── README.md
 ```
@@ -112,10 +114,34 @@ sudo systemctl enable --now model-gateway
 
 После запуска доступны:
 
-- `GET /manager/html` — встроенная HTML-панель
+- `GET /manager/html` — fallback embedded HTML-панель
 - `GET /manager/api/dashboard` — JSON со статистикой, backend status и опубликованными моделями
 
-Если включена Bearer-аутентификация, `manager/api/dashboard` использует тот же токен, что и основной gateway API.
+Manager API поддерживает тот же Bearer token, что и основной gateway API, и отдельную PIN-сессию для UI.
+
+### Manager UI на 3025
+
+Frontend лежит в `manager-ui` и построен на Vue 3 + компонентах Sigma UI:
+
+```bash
+cd manager-ui
+npm install
+npm run build
+
+# из корня репозитория
+GATEWAY_UI_STATIC_ROOT="$PWD/manager-ui/dist" \
+GATEWAY_UI_PORT=3025 \
+python3 scripts/gateway-ui-proxy.py
+```
+
+После этого:
+
+- `GET /` на UI-порту отдаёт собранный Vue Manager UI
+- `POST /manager/api/login` проверяет PIN и ставит HttpOnly session cookie
+- `GET /manager/api/dashboard` отдаёт данные панели
+- `POST /manager/api/logout` закрывает UI-сессию
+
+По умолчанию PIN `2064564`. После 3 неверных попыток IP блокируется на 30 минут. В production переопределяйте `MODEL_GATEWAY_MANAGER_PIN` в `.env`.
 
 ---
 
@@ -138,6 +164,10 @@ sudo systemctl enable --now model-gateway
 | `THINKING_BUDGET` | `-1` | `-1`=не управлять, `0`=отключить, `>0`=лимит токенов |
 | `MODEL_QUEUE_MAX_SIZE` | `5` | Максимум ожидающих LLM-запросов на физический backend |
 | `MODEL_QUEUE_TIMEOUT` | `60` | Максимум ожидания свободного слота backend'а, секунд |
+| `MODEL_GATEWAY_MANAGER_PIN` | `2064564` | PIN для Manager UI |
+| `MODEL_GATEWAY_MANAGER_PIN_MAX_ATTEMPTS` | `3` | Количество неверных PIN до временного бана |
+| `MODEL_GATEWAY_MANAGER_PIN_BAN_SECONDS` | `1800` | Длительность бана после неверных PIN, секунд |
+| `MODEL_GATEWAY_MANAGER_SESSION_TTL` | `43200` | TTL UI-сессии, секунд |
 | `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091` или `https://image.example.com`) |
 | `IMAGE_BACKEND_TOKEN` | `""` | Bearer-токен для image-сервиса |
 | `XAI_API_BASE_URL` | `https://api.x.ai/v1` | Базовый URL OpenAI-совместимого xAI API |
