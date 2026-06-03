@@ -36,6 +36,9 @@ Environment="THINKING_MODELS=model-name-1"
 # Thinking budget: -1=не управлять, 0=отключить thinking, >0=лимит токенов
 Environment="THINKING_BUDGET=0"
 
+# Manager UI / token administration
+Environment="MODEL_GATEWAY_TOKEN_STORE=/path/to/model-gateway/gateway_tokens.json"
+
 # Image backend (опционально)
 Environment="IMAGE_BACKEND_URL=http://127.0.0.1:8091"
 Environment="IMAGE_BACKEND_TOKEN=YOUR_IMAGE_TOKEN"

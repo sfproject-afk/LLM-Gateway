@@ -155,6 +155,12 @@ class GatewayUIProxy(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._handle()
 
+    def do_PATCH(self) -> None:
+        self._handle()
+
+    def do_DELETE(self) -> None:
+        self._handle()
+
 
 def main() -> None:
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), GatewayUIProxy)

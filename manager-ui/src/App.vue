@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { Activity, BarChart3, CircleAlert, Clock3, Database, GitBranch, LockKeyhole, LogOut, RefreshCcw, Server } from "lucide-vue-next";
+import { Activity, BarChart3, CircleAlert, Clock3, Copy, Database, GitBranch, KeyRound, LockKeyhole, LogOut, RefreshCcw, Server, Trash2 } from "lucide-vue-next";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
@@ -21,14 +21,21 @@ type Dashboard = {
   queues: QueueRow[];
   stats: { recent_requests: RequestRow[]; recent_errors: ErrorRow[]; load_buckets: LoadBucket[] };
 };
+type TokenRow = { id: string; label: string; prefix: string; source: string; enabled: boolean; created_at?: number | null; last_used_at?: number | null; request_count?: number | null; readonly: boolean };
+type TokenPayload = { store_path: string; auth_enabled: boolean; tokens: TokenRow[] };
 
 const pin = ref("");
 const pinMessage = ref("");
 const isLocked = ref(true);
 const isLoading = ref(false);
 const dashboard = ref<Dashboard | null>(null);
+const tokenPayload = ref<TokenPayload | null>(null);
 const loadError = ref("");
 const refreshTime = ref("");
+const tokenMessage = ref("");
+const newTokenLabel = ref("");
+const newTokenRaw = ref("");
+const createdToken = ref("");
 let timer: number | undefined;
 
 const queues = computed(() => dashboard.value?.queues ?? []);
@@ -82,11 +89,25 @@ async function loadDashboard() {
     refreshTime.value = new Date().toLocaleTimeString("ru-RU");
     isLocked.value = false;
     pinMessage.value = "";
+    await loadTokens(true);
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : String(err);
   } finally {
     isLoading.value = false;
   }
+}
+
+async function loadTokens(silent = false) {
+  if (!silent) tokenMessage.value = "Обновляю токены...";
+  const res = await fetch("/manager/api/tokens", { credentials: "same-origin" });
+  if (res.status === 401) {
+    isLocked.value = true;
+    tokenMessage.value = "";
+    return;
+  }
+  if (!res.ok) throw new Error(`Token API ${res.status}: ${await res.text()}`);
+  tokenPayload.value = await res.json();
+  if (!silent) tokenMessage.value = "Токены обновлены.";
 }
 
 async function login() {
@@ -107,9 +128,68 @@ async function login() {
     pin.value = "";
     isLocked.value = false;
     await loadDashboard();
+    await loadTokens(true);
   } catch (err) {
     pinMessage.value = err instanceof Error ? err.message : String(err);
   }
+}
+
+async function createToken() {
+  tokenMessage.value = "Создаю токен...";
+  createdToken.value = "";
+  try {
+    const res = await fetch("/manager/api/tokens", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: newTokenLabel.value.trim(), token: newTokenRaw.value.trim() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+    createdToken.value = data.token || "";
+    tokenPayload.value = { ...(tokenPayload.value || { store_path: "", auth_enabled: true }), tokens: data.tokens || [] };
+    newTokenLabel.value = "";
+    newTokenRaw.value = "";
+    tokenMessage.value = data.message || "Токен создан.";
+  } catch (err) {
+    tokenMessage.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function updateToken(row: TokenRow, enabled: boolean) {
+  try {
+    const res = await fetch(`/manager/api/tokens/${encodeURIComponent(row.id)}`, {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) throw new Error(`Token API ${res.status}: ${await res.text()}`);
+    tokenPayload.value = await res.json();
+    tokenMessage.value = enabled ? "Токен включен." : "Токен отключен.";
+  } catch (err) {
+    tokenMessage.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function deleteToken(row: TokenRow) {
+  try {
+    const res = await fetch(`/manager/api/tokens/${encodeURIComponent(row.id)}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+    if (!res.ok) throw new Error(`Token API ${res.status}: ${await res.text()}`);
+    tokenPayload.value = await res.json();
+    tokenMessage.value = "Токен удален.";
+  } catch (err) {
+    tokenMessage.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function copyCreatedToken() {
+  if (!createdToken.value) return;
+  await navigator.clipboard.writeText(createdToken.value);
+  tokenMessage.value = "Токен скопирован.";
 }
 
 async function logout() {
@@ -162,6 +242,7 @@ onUnmounted(() => {
           <a href="#overview">Home</a>
           <a href="#load">Docs</a>
           <a href="#queues" class="font-semibold text-foreground">Components</a>
+          <a href="#tokens">Tokens</a>
           <a href="#stats" class="inline-flex items-center gap-2">Blocks <Badge variant="secondary">Alpha</Badge></a>
           <a href="#errors" class="inline-flex items-center gap-2">Changelog <Badge variant="secondary">v2</Badge></a>
         </nav>
@@ -181,6 +262,7 @@ onUnmounted(() => {
           <p class="mb-2 mt-5 font-semibold text-foreground">Components</p>
           <a class="nav-link" href="#backends">Backend status</a>
           <a class="nav-link" href="#models">Published models</a>
+          <a class="nav-link" href="#tokens">Token admin</a>
           <a class="nav-link" href="#stats">Recent requests</a>
           <a class="nav-link" href="#errors">Recent errors</a>
           <p class="mb-2 mt-5 font-semibold text-foreground">Instructions</p>
@@ -246,6 +328,54 @@ onUnmounted(() => {
             <CardContent class="p-0"><Table><TableHeader><TableRow><TableHead>Backend</TableHead><TableHead>Active</TableHead><TableHead>Waiting</TableHead><TableHead>Limit</TableHead><TableHead>Last wait</TableHead><TableHead>Totals</TableHead></TableRow></TableHeader><TableBody><TableRow v-for="row in queues" :key="row.queue_key"><TableCell class="font-mono">{{ row.queue_key }}</TableCell><TableCell><Badge v-if="row.active" variant="secondary">{{ row.active_model || "active" }}</Badge><span v-else>-</span></TableCell><TableCell>{{ row.waiting }}<div class="mt-2 h-2 overflow-hidden rounded-full border border-white/10 bg-white/10"><div class="h-full bg-emerald-400" :style="{ width: `${queuePercent(row)}%` }" /></div></TableCell><TableCell>{{ row.max_queue_size }} / {{ row.timeout_seconds }}s</TableCell><TableCell>{{ row.last_wait_ms || 0 }} ms</TableCell><TableCell class="text-muted-foreground">queued {{ row.queued_total }}, full {{ row.full_total }}, timeout {{ row.timeout_total }}</TableCell></TableRow></TableBody></Table></CardContent>
           </Card>
 
+          <Card id="tokens" class="mt-6 border-white/10 bg-black/30 backdrop-blur-xl">
+            <CardHeader class="border-b border-white/10 pb-3">
+              <div class="flex items-center justify-between">
+                <CardTitle class="flex items-center gap-2 text-lg"><KeyRound class="h-4 w-4 text-emerald-400" />Администрирование токенов</CardTitle>
+                <Badge variant="secondary">{{ tokenPayload?.tokens.length ?? 0 }} tokens</Badge>
+              </div>
+            </CardHeader>
+            <CardContent class="space-y-4">
+              <form class="grid gap-3 md:grid-cols-[1fr_1fr_auto]" @submit.prevent="createToken">
+                <Input v-model="newTokenLabel" placeholder="Label клиента, например openwebui" class="bg-black/30" />
+                <Input v-model="newTokenRaw" placeholder="Свой token или пусто для auto-generate" class="bg-black/30" />
+                <Button type="submit">Создать</Button>
+              </form>
+              <div v-if="createdToken" class="rounded-md border border-emerald-400/20 bg-emerald-400/10 p-3">
+                <p class="mb-2 text-xs text-muted-foreground">Сохраните токен сейчас. Повторно он не будет отображаться.</p>
+                <div class="flex flex-wrap items-center gap-2">
+                  <code class="break-all rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs">{{ createdToken }}</code>
+                  <Button type="button" variant="outline" size="sm" @click="copyCreatedToken"><Copy class="mr-2 h-3.5 w-3.5" />Copy</Button>
+                </div>
+              </div>
+              <div class="text-xs text-muted-foreground">
+                Store: {{ tokenPayload?.store_path || "-" }} · Auth: {{ tokenPayload?.auth_enabled ? "enabled" : "disabled" }} · {{ tokenMessage }}
+              </div>
+              <Table>
+                <TableHeader>
+                  <TableRow><TableHead>Label</TableHead><TableHead>Prefix</TableHead><TableHead>Source</TableHead><TableHead>Created</TableHead><TableHead>Used</TableHead><TableHead>Actions</TableHead></TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow v-for="row in tokenPayload?.tokens ?? []" :key="row.id">
+                    <TableCell class="font-medium">{{ row.label }}</TableCell>
+                    <TableCell class="font-mono">{{ row.prefix }}</TableCell>
+                    <TableCell><Badge :variant="row.source === 'env' ? 'outline' : 'secondary'">{{ row.source }}</Badge></TableCell>
+                    <TableCell>{{ fmtTime(row.created_at) }}</TableCell>
+                    <TableCell>{{ row.last_used_at ? fmtTime(row.last_used_at) : "-" }}<span v-if="row.request_count != null" class="ml-1 text-muted-foreground">({{ row.request_count }})</span></TableCell>
+                    <TableCell>
+                      <div class="flex flex-wrap gap-2">
+                        <Badge v-if="row.enabled" variant="secondary">enabled</Badge>
+                        <Badge v-else variant="destructive">disabled</Badge>
+                        <Button v-if="!row.readonly" type="button" variant="outline" size="xs" @click="updateToken(row, !row.enabled)">{{ row.enabled ? "Disable" : "Enable" }}</Button>
+                        <Button v-if="!row.readonly" type="button" variant="destructive" size="xs" @click="deleteToken(row)"><Trash2 class="mr-1 h-3 w-3" />Delete</Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
           <Card id="errors" class="mt-6 border-white/10 bg-black/30 backdrop-blur-xl">
             <CardHeader class="border-b border-white/10 pb-3"><div class="flex items-center justify-between"><CardTitle class="text-lg">Последние ошибки</CardTitle><Badge variant="secondary">max 20</Badge></div></CardHeader>
             <CardContent class="space-y-2">
@@ -257,7 +387,7 @@ onUnmounted(() => {
 
         <aside class="sticky top-12 h-[calc(100vh-48px)] overflow-auto border-l border-white/10 bg-black/10 px-5 py-8 text-xs text-muted-foreground max-[1180px]:hidden">
           <p class="mb-2 font-semibold text-foreground">Table of content</p>
-          <a class="toc-link" href="#overview">Overview</a><a class="toc-link" href="#load">Load</a><a class="toc-link" href="#backends">Backends</a><a class="toc-link" href="#models">Models</a><a class="toc-link" href="#stats">Statistics</a><a class="toc-link" href="#queues">Queue</a><a class="toc-link" href="#errors">Errors</a>
+          <a class="toc-link" href="#overview">Overview</a><a class="toc-link" href="#load">Load</a><a class="toc-link" href="#backends">Backends</a><a class="toc-link" href="#models">Models</a><a class="toc-link" href="#tokens">Tokens</a><a class="toc-link" href="#stats">Statistics</a><a class="toc-link" href="#queues">Queue</a><a class="toc-link" href="#errors">Errors</a>
           <Separator class="my-5 bg-white/10" />
           <p class="mb-2 font-semibold text-foreground">Queue rules</p>
           <div class="toc-link"><GitBranch class="mr-2 h-3.5 w-3.5" />1 active request</div><div class="toc-link">others wait</div><div class="toc-link">position in headers</div>

@@ -139,9 +139,19 @@ python3 scripts/gateway-ui-proxy.py
 - `GET /` на UI-порту отдаёт собранный Vue Manager UI
 - `POST /manager/api/login` проверяет PIN и ставит HttpOnly session cookie
 - `GET /manager/api/dashboard` отдаёт данные панели
+- `GET/POST/PATCH/DELETE /manager/api/tokens` управляет Bearer-токенами
 - `POST /manager/api/logout` закрывает UI-сессию
 
 По умолчанию PIN `2064564`. После 3 неверных попыток IP блокируется на 30 минут. В production переопределяйте `MODEL_GATEWAY_MANAGER_PIN` в `.env`.
+
+### Администрирование токенов
+
+Manager UI умеет создавать и отключать Bearer-токены без рестарта gateway.
+
+- токены из `MODEL_GATEWAY_TOKEN` / `MODEL_GATEWAY_TOKENS` остаются read-only и отображаются только как prefix
+- managed-токены хранятся в `MODEL_GATEWAY_TOKEN_STORE` как SHA-256 hash, raw token показывается только один раз при создании
+- если нет env-токенов и нет enabled managed-токенов, основной API работает как раньше без Bearer auth
+- как только есть хотя бы один env или enabled managed token, основной API требует `Authorization: Bearer ...`
 
 ---
 
@@ -168,6 +178,7 @@ python3 scripts/gateway-ui-proxy.py
 | `MODEL_GATEWAY_MANAGER_PIN_MAX_ATTEMPTS` | `3` | Количество неверных PIN до временного бана |
 | `MODEL_GATEWAY_MANAGER_PIN_BAN_SECONDS` | `1800` | Длительность бана после неверных PIN, секунд |
 | `MODEL_GATEWAY_MANAGER_SESSION_TTL` | `43200` | TTL UI-сессии, секунд |
+| `MODEL_GATEWAY_TOKEN_STORE` | `gateway_tokens.json` | JSON-хранилище managed Bearer-токенов |
 | `IMAGE_BACKEND_URL` | `""` | URL image-сервиса (напр. `http://127.0.0.1:8091` или `https://image.example.com`) |
 | `IMAGE_BACKEND_TOKEN` | `""` | Bearer-токен для image-сервиса |
 | `XAI_API_BASE_URL` | `https://api.x.ai/v1` | Базовый URL OpenAI-совместимого xAI API |

@@ -19,6 +19,7 @@ Environment variables:
 """
 
 import http.client
+import hashlib
 import json
 import os
 import secrets
@@ -51,14 +52,14 @@ if _TOKENS_RAW:
             _token_map[_tok.strip()] = _label.strip()
         elif _entry:
             _token_map[_entry] = "unknown"
-    ALLOWED_TOKENS: frozenset[str] = frozenset(_token_map)
-    TOKEN_LABELS: dict[str, str] = _token_map
+    ENV_ALLOWED_TOKENS: frozenset[str] = frozenset(_token_map)
+    ENV_TOKEN_LABELS: dict[str, str] = _token_map
 elif TOKEN:
-    ALLOWED_TOKENS = frozenset({TOKEN})
-    TOKEN_LABELS = {TOKEN: "admin"}
+    ENV_ALLOWED_TOKENS = frozenset({TOKEN})
+    ENV_TOKEN_LABELS = {TOKEN: "admin"}
 else:
-    ALLOWED_TOKENS = frozenset()
-    TOKEN_LABELS = {}
+    ENV_ALLOWED_TOKENS = frozenset()
+    ENV_TOKEN_LABELS = {}
 
 # Parse VLLM_BACKENDS env: JSON map  model_name → "host:port"
 _BACKENDS_RAW = os.environ.get("VLLM_BACKENDS", "")
@@ -134,6 +135,7 @@ MANAGER_PIN = os.environ.get("MODEL_GATEWAY_MANAGER_PIN", "2064564")
 MANAGER_PIN_MAX_ATTEMPTS = int(os.environ.get("MODEL_GATEWAY_MANAGER_PIN_MAX_ATTEMPTS", "3"))
 MANAGER_PIN_BAN_SECONDS = int(os.environ.get("MODEL_GATEWAY_MANAGER_PIN_BAN_SECONDS", "1800"))
 MANAGER_SESSION_TTL = int(os.environ.get("MODEL_GATEWAY_MANAGER_SESSION_TTL", "43200"))
+TOKEN_STORE_PATH = os.environ.get("MODEL_GATEWAY_TOKEN_STORE", "gateway_tokens.json")
 
 # Thinking-model config: control reasoning/thinking behaviour per model.
 # THINKING_MODELS — comma-separated model names that support thinking mode.
@@ -182,6 +184,186 @@ QUEUE_STATES: dict[str, dict] = {}
 MANAGER_AUTH_LOCK = threading.Lock()
 MANAGER_PIN_FAILURES: dict[str, dict] = {}
 MANAGER_SESSIONS: dict[str, dict] = {}
+TOKEN_STORE_LOCK = threading.Lock()
+MANAGED_TOKENS: dict[str, dict] = {}
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _token_prefix(token: str) -> str:
+    if len(token) <= 10:
+        return token
+    return f"{token[:6]}...{token[-4:]}"
+
+
+def _env_token_summaries() -> list[dict]:
+    rows = []
+    for token, label in sorted(ENV_TOKEN_LABELS.items(), key=lambda item: item[1]):
+        rows.append({
+            "id": f"env:{_token_hash(token)[:12]}",
+            "label": label,
+            "prefix": _token_prefix(token),
+            "source": "env",
+            "enabled": True,
+            "created_at": None,
+            "last_used_at": None,
+            "request_count": None,
+            "readonly": True,
+        })
+    return rows
+
+
+def _load_managed_tokens() -> None:
+    path = TOKEN_STORE_PATH
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        print(f"[gateway] token store load failed: {exc}", flush=True)
+        return
+
+    rows = payload.get("tokens", []) if isinstance(payload, dict) else []
+    with TOKEN_STORE_LOCK:
+        MANAGED_TOKENS.clear()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            token_id = str(row.get("id", "")).strip()
+            token_hash = str(row.get("token_hash", "")).strip()
+            if not token_id or not token_hash:
+                continue
+            MANAGED_TOKENS[token_id] = {
+                "id": token_id,
+                "label": str(row.get("label") or "managed"),
+                "token_hash": token_hash,
+                "prefix": str(row.get("prefix") or ""),
+                "enabled": bool(row.get("enabled", True)),
+                "created_at": float(row.get("created_at") or time.time()),
+                "last_used_at": float(row["last_used_at"]) if row.get("last_used_at") else None,
+                "request_count": int(row.get("request_count") or 0),
+            }
+
+
+def _save_managed_tokens_locked() -> None:
+    if not TOKEN_STORE_PATH:
+        return
+    path = os.path.abspath(TOKEN_STORE_PATH)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    payload = {
+        "version": 1,
+        "updated_at": time.time(),
+        "tokens": sorted(MANAGED_TOKENS.values(), key=lambda row: row.get("created_at", 0)),
+    }
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp_path, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _managed_token_summaries_locked() -> list[dict]:
+    rows = []
+    for row in sorted(MANAGED_TOKENS.values(), key=lambda item: item.get("created_at", 0), reverse=True):
+        rows.append({
+            "id": row["id"],
+            "label": row.get("label") or "managed",
+            "prefix": row.get("prefix") or "",
+            "source": "managed",
+            "enabled": bool(row.get("enabled", True)),
+            "created_at": row.get("created_at"),
+            "last_used_at": row.get("last_used_at"),
+            "request_count": int(row.get("request_count") or 0),
+            "readonly": False,
+        })
+    return rows
+
+
+def _token_auth_enabled() -> bool:
+    if ENV_ALLOWED_TOKENS:
+        return True
+    with TOKEN_STORE_LOCK:
+        return any(row.get("enabled", True) for row in MANAGED_TOKENS.values())
+
+
+def _lookup_token(token: str, *, record_usage: bool = False) -> dict | None:
+    if token in ENV_ALLOWED_TOKENS:
+        return {"label": ENV_TOKEN_LABELS.get(token, "unknown"), "source": "env"}
+
+    token_hash = _token_hash(token)
+    with TOKEN_STORE_LOCK:
+        for row in MANAGED_TOKENS.values():
+            if row.get("enabled", True) and secrets.compare_digest(str(row.get("token_hash", "")), token_hash):
+                if record_usage:
+                    row["last_used_at"] = time.time()
+                    row["request_count"] = int(row.get("request_count") or 0) + 1
+                return row
+    return None
+
+
+def _build_token_payload() -> dict:
+    with TOKEN_STORE_LOCK:
+        managed = _managed_token_summaries_locked()
+    return {
+        "store_path": os.path.abspath(TOKEN_STORE_PATH) if TOKEN_STORE_PATH else "",
+        "auth_enabled": _token_auth_enabled(),
+        "tokens": _env_token_summaries() + managed,
+    }
+
+
+def _create_managed_token(label: str, raw_token: str | None = None) -> dict:
+    label = (label or "managed").strip()[:80] or "managed"
+    token = (raw_token or "").strip() or f"gw_{secrets.token_urlsafe(32)}"
+    token_id = secrets.token_hex(8)
+    now = time.time()
+    row = {
+        "id": token_id,
+        "label": label,
+        "token_hash": _token_hash(token),
+        "prefix": _token_prefix(token),
+        "enabled": True,
+        "created_at": now,
+        "last_used_at": None,
+        "request_count": 0,
+    }
+    with TOKEN_STORE_LOCK:
+        MANAGED_TOKENS[token_id] = row
+        _save_managed_tokens_locked()
+    return {"token": token, "record": row}
+
+
+def _update_managed_token(token_id: str, payload: dict) -> dict | None:
+    with TOKEN_STORE_LOCK:
+        row = MANAGED_TOKENS.get(token_id)
+        if not row:
+            return None
+        if "label" in payload:
+            row["label"] = str(payload.get("label") or "managed").strip()[:80] or "managed"
+        if "enabled" in payload:
+            row["enabled"] = bool(payload.get("enabled"))
+        _save_managed_tokens_locked()
+        return dict(row)
+
+
+def _delete_managed_token(token_id: str) -> bool:
+    with TOKEN_STORE_LOCK:
+        if token_id not in MANAGED_TOKENS:
+            return False
+        del MANAGED_TOKENS[token_id]
+        _save_managed_tokens_locked()
+        return True
+
+
+_load_managed_tokens()
 
 MANAGER_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -1675,19 +1857,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # ---- Auth -----------------------------------------------------------
 
     def _authorized(self) -> bool:
-        if not ALLOWED_TOKENS:
+        if not _token_auth_enabled():
             return True
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return False
         tok = auth[7:]
-        return tok in ALLOWED_TOKENS
+        return _lookup_token(tok, record_usage=True) is not None
 
     def _client_label(self) -> str:
         """Return the label associated with the request's Bearer token."""
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            return TOKEN_LABELS.get(auth[7:], "unknown")
+            row = _lookup_token(auth[7:])
+            return str(row.get("label", "unknown")) if row else "unknown"
         return "anon"
 
     def _client_ip(self) -> str:
@@ -1826,6 +2009,87 @@ class GatewayHandler(BaseHTTPRequestHandler):
             client=f"pin:{self._client_ip()}",
             duration_ms=int((time.time() - started) * 1000),
             upstream="embedded-ui",
+        )
+
+    def _handle_manager_tokens(self, token_id: str | None = None):
+        started = time.time()
+        path = "/manager/api/tokens" if token_id is None else f"/manager/api/tokens/{token_id}"
+        if not self._manager_authorized():
+            self._send_json(401, {
+                "error": "unauthorized",
+                "message": "Введите PIN-код для управления токенами.",
+            })
+            _record_request_stat(
+                path=path,
+                status=401,
+                client=self._client_label(),
+                duration_ms=int((time.time() - started) * 1000),
+                upstream="embedded-ui",
+                error="unauthorized",
+            )
+            return
+
+        status = 200
+        error = None
+        try:
+            if self.command == "GET" and token_id is None:
+                payload = _build_token_payload()
+            elif self.command == "POST" and token_id is None:
+                body = self._read_request_body()
+                try:
+                    request = json.loads(body) if body else {}
+                except Exception:
+                    request = {}
+                created = _create_managed_token(
+                    label=str(request.get("label") or "managed"),
+                    raw_token=str(request.get("token") or "").strip() or None,
+                )
+                with TOKEN_STORE_LOCK:
+                    record = _managed_token_summaries_locked()
+                payload = {
+                    "ok": True,
+                    "token": created["token"],
+                    "message": "Сохраните токен сейчас. Повторно он не отображается.",
+                    "tokens": _env_token_summaries() + record,
+                }
+                status = 201
+            elif self.command == "PATCH" and token_id:
+                body = self._read_request_body()
+                try:
+                    request = json.loads(body) if body else {}
+                except Exception:
+                    request = {}
+                updated = _update_managed_token(token_id, request)
+                if not updated:
+                    payload = {"error": "token_not_found", "message": "Токен не найден или является env-токеном."}
+                    status = 404
+                    error = "token_not_found"
+                else:
+                    payload = {"ok": True, "token": updated, **_build_token_payload()}
+            elif self.command == "DELETE" and token_id:
+                if not _delete_managed_token(token_id):
+                    payload = {"error": "token_not_found", "message": "Токен не найден или является env-токеном."}
+                    status = 404
+                    error = "token_not_found"
+                else:
+                    payload = {"ok": True, **_build_token_payload()}
+            else:
+                payload = {"error": "method_not_allowed"}
+                status = 405
+                error = "method_not_allowed"
+        except Exception as exc:
+            payload = {"error": "token_admin_failed", "message": str(exc)}
+            status = 500
+            error = "token_admin_failed"
+
+        self._send_json(status, payload)
+        _record_request_stat(
+            path=path,
+            status=status,
+            client=self._client_label(),
+            duration_ms=int((time.time() - started) * 1000),
+            upstream="embedded-ui",
+            error=error,
         )
 
     # ---- Helpers --------------------------------------------------------
@@ -2211,6 +2475,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._handle_manager_dashboard()
             return
 
+        raw_path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        if raw_path == "/manager/api/tokens" and self.command in {"GET", "POST"}:
+            self._handle_manager_tokens()
+            return
+
+        token_prefix = "/manager/api/tokens/"
+        if raw_path.startswith(token_prefix) and self.command in {"PATCH", "DELETE"}:
+            self._handle_manager_tokens(urllib.parse.unquote(raw_path[len(token_prefix):]))
+            return
+
         if urllib.parse.urlsplit(self.path).path.startswith("/zimage/") or path_only == "/v1/images/generations":
             self._proxy_image_request()
             return
@@ -2462,7 +2736,8 @@ def main():
         f"[gateway] {LISTEN_HOST}:{LISTEN_PORT}  "
         f"backends=[{summary}]  "
         f"primary={PRIMARY_BACKEND[2]}://{PRIMARY_BACKEND[0]}:{PRIMARY_BACKEND[1]}  "
-        f"auth={'token' if ALLOWED_TOKENS else 'DISABLED'}",
+        f"auth={'token' if _token_auth_enabled() else 'DISABLED'}  "
+        f"token_store={os.path.abspath(TOKEN_STORE_PATH) if TOKEN_STORE_PATH else 'disabled'}",
         flush=True,
     )
     try:
