@@ -3,3 +3,8 @@
 __pycache__/
 *.log
 *.db
+gateway_tokens.json
+gateway_tokens.json.tmp
+node_modules/
+dist/
+*.tsbuildinfo
